@@ -12,6 +12,7 @@ The important idea is simple:
 ```text
 stateless decides whether a transition is legal
 the provider atomically commits durable state and outgoing signals
+workers claim shard leases before processing work
 entry handlers run after commit and are retried until marked done
 ```
 
@@ -85,9 +86,10 @@ recover it as soon as it comes online:
 processed, err := worker.Work(ctx, 100)
 ```
 
-That claims durable signals and entry work for the worker's shards.
+That first acquires shard leases, then claims durable signals and entry work for
+those leased shards.
 Workers recover unfinished entry work before applying queued signals, so a
-signal does not get stuck behind a lease for work the same worker could have
+signal does not get stuck behind work the same worker could have
 completed first.
 
 What the runtime does **not** do is scan every non-terminal machine and ask
@@ -99,7 +101,8 @@ Shard ownership is therefore a worker concern:
 ```text
 worker owns shards [3, 7]
 worker calls Work(...)
-provider only leases signals and entries for those shards
+provider acquires shard leases for [3, 7]
+provider claims signals and entries only for those live lease epochs
 ```
 
 Shard assignment is a runtime concern. By default all machines live on shard
@@ -112,7 +115,7 @@ Crash behavior:
 ```text
 before transition commit              -> no state change exists
 after commit, before handler starts   -> pending entry is recovered
-during handler                        -> lease expires; entry is retried
+during handler                        -> shard lease expires; entry is retried
 after side effect, before done mark   -> same entry key is retried
 handler returns next trigger/signals  -> done mark + outputs commit atomically
 ```
@@ -140,7 +143,7 @@ exhausted, the row becomes `dead_lettered` and is no longer claimable. A
 dead-lettered entry still blocks the machine version it belongs to; that is
 intentional, because the state-entry work never completed safely.
 
-Workers also renew entry-handler leases while the handler is running:
+Workers renew shard leases while `Work` is running:
 
 ```go
 rt := durablestateless.NewRuntime(
@@ -153,8 +156,16 @@ rt := durablestateless.NewRuntime(
 
 If `WithLeaseRenewalInterval` is omitted, the worker derives an interval from
 the lease duration. A negative renewal interval disables automatic renewal.
-Signal processing is expected to be short; automatic renewal is for entry
-handlers.
+
+Leases are per shard, not per entry or signal. Claimed rows record the shard
+lease epoch that owned them. Completion and failure are fenced by
+`(owner, owner_epoch, attempt)`, so a stale worker cannot finish work after the
+shard has been reacquired.
+
+The `limit` passed to `worker.Work(ctx, limit)` is a batch budget: one completed
+signal or one completed entry handler counts as one unit. Pick a number that
+keeps one call responsive while still amortizing provider round trips; tens to a
+few hundreds is a reasonable starting point for typical handlers.
 
 ## Next Vs Signals
 
@@ -307,8 +318,10 @@ Providers expose atomic commands, not interactive transactions:
 
 ```go
 EnqueueSignal(ctx, signal)
-ClaimSignals(ctx, owner, shards, limit, lease)
-ClaimEntries(ctx, owner, shards, limit, lease)
+AcquireShardLeases(ctx, owner, shards, lease)
+RenewShardLeases(ctx, owner, leases, lease)
+ClaimSignals(ctx, leases, limit)
+ClaimEntries(ctx, leases, limit)
 Commit(ctx, atomicCommit)
 ```
 
@@ -318,13 +331,13 @@ short internal transaction to do this, but that is an implementation detail.
 Other providers can use conditional writes, CAS, batch writes, or an append log
 plus projection.
 
-Completion and failure use the claim's `(owner, attempt)` pair, not just owner,
-so a stale process cannot finish work after the same worker ID has reclaimed an
-expired lease.
+Completion and failure use the claim's `(owner, owner_epoch, attempt)` tuple,
+not just owner, so a stale process cannot finish work after the same worker ID
+has reacquired the shard with a newer epoch.
 
 Failed rows carry a `retry_at` timestamp. Providers should only claim failed
-rows after that time, and should never claim `dead_lettered` rows. Lease renewal
-must also be guarded by `(owner, attempt)`.
+rows after that time, and should never claim `dead_lettered` rows. Shard lease
+renewal must be guarded by `(owner, epoch)`.
 
 ## Current Scope
 

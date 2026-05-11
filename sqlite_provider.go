@@ -3,6 +3,7 @@ package durablestateless
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -58,6 +59,7 @@ func (p *SQLiteProvider) Migrate(ctx context.Context) error {
 			args_json text not null,
 			status text not null,
 			owner text,
+			owner_epoch integer not null default 0,
 			lease_until text,
 			retry_at text,
 			attempts integer not null default 0,
@@ -76,6 +78,7 @@ func (p *SQLiteProvider) Migrate(ctx context.Context) error {
 			args_json text not null,
 			status text not null,
 			owner text,
+			owner_epoch integer not null default 0,
 			lease_until text,
 			retry_at text,
 			attempts integer not null default 0,
@@ -84,6 +87,13 @@ func (p *SQLiteProvider) Migrate(ctx context.Context) error {
 			completed_at text,
 			last_error text,
 			foreign key(machine_id) references machines(id)
+		)`,
+		`create table if not exists shard_leases (
+			shard_id integer primary key,
+			owner text not null,
+			epoch integer not null,
+			lease_until text not null,
+			updated_at text not null
 		)`,
 	}
 	for _, stmt := range stmts {
@@ -95,6 +105,12 @@ func (p *SQLiteProvider) Migrate(ctx context.Context) error {
 		return err
 	}
 	if err := addColumnIfMissing(ctx, p.db, "machine_signals", "retry_at", "text"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, p.db, "machine_entries", "owner_epoch", "integer not null default 0"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, p.db, "machine_signals", "owner_epoch", "integer not null default 0"); err != nil {
 		return err
 	}
 	indexes := []string{
@@ -153,11 +169,11 @@ func (p *SQLiteProvider) EnqueueSignal(ctx context.Context, signal SignalRecord)
 	return enqueueSignalSQL(ctx, p.db, signal)
 }
 
-func (p *SQLiteProvider) ClaimSignals(ctx context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]SignalRecord, error) {
+func (p *SQLiteProvider) AcquireShardLeases(ctx context.Context, owner string, shards []ShardID, lease time.Duration) ([]ShardLease, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("durablestateless: owner is required")
 	}
-	if limit <= 0 || len(shards) == 0 {
+	if len(shards) == 0 {
 		return nil, nil
 	}
 	if err := validateShardIDs(shards); err != nil {
@@ -176,23 +192,152 @@ func (p *SQLiteProvider) ClaimSignals(ctx context.Context, owner string, shards 
 	committed := false
 	defer rollbackUnlessCommitted(conn, &committed)
 
-	placeholders := make([]string, len(shards))
-	args := make([]any, 0, len(shards)+2)
-	for i, shard := range shards {
-		placeholders[i] = "?"
-		args = append(args, shard)
-	}
 	now := nowUTC()
-	args = append(args, formatTime(now), formatTime(now), limit)
+	leaseUntil := now.Add(lease)
+	leases := make([]ShardLease, 0, len(shards))
+	for _, shard := range shards {
+		current, err := readShardLeaseSQL(ctx, conn, shard)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if current != nil && current.LeaseUntil.After(now) && current.Owner != owner {
+			continue
+		}
+
+		epoch := int64(1)
+		if current != nil {
+			epoch = current.Epoch
+			if current.Owner != owner || !current.LeaseUntil.After(now) {
+				epoch++
+			}
+			_, err = conn.ExecContext(ctx,
+				`update shard_leases
+				    set owner = ?,
+				        epoch = ?,
+				        lease_until = ?,
+				        updated_at = ?
+				  where shard_id = ?`,
+				owner, epoch, formatTime(leaseUntil), formatTime(now), shard,
+			)
+		} else {
+			_, err = conn.ExecContext(ctx,
+				`insert into shard_leases(shard_id, owner, epoch, lease_until, updated_at)
+				 values(?, ?, ?, ?, ?)`,
+				shard, owner, epoch, formatTime(leaseUntil), formatTime(now),
+			)
+		}
+		if err != nil {
+			return nil, err
+		}
+		leases = append(leases, ShardLease{
+			ShardID:    shard,
+			Owner:      owner,
+			Epoch:      epoch,
+			LeaseUntil: leaseUntil,
+			UpdatedAt:  now,
+		})
+	}
+
+	if err := commitSQL(ctx, conn); err != nil {
+		return nil, err
+	}
+	committed = true
+	return leases, nil
+}
+
+func (p *SQLiteProvider) RenewShardLeases(ctx context.Context, owner string, leases []ShardLease, lease time.Duration) ([]ShardLease, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("durablestateless: owner is required")
+	}
+	if len(leases) == 0 {
+		return nil, nil
+	}
+
+	conn, err := p.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := beginImmediate(ctx, conn); err != nil {
+		return nil, err
+	}
+	committed := false
+	defer rollbackUnlessCommitted(conn, &committed)
+
+	now := nowUTC()
+	leaseUntil := now.Add(lease)
+	renewed := make([]ShardLease, 0, len(leases))
+	for _, leaseToken := range leases {
+		res, err := conn.ExecContext(ctx,
+			`update shard_leases
+			    set lease_until = ?,
+			        updated_at = ?
+			  where shard_id = ?
+			    and owner = ?
+			    and epoch = ?
+			    and lease_until > ?`,
+			formatTime(leaseUntil), formatTime(now), leaseToken.ShardID, owner, leaseToken.Epoch, formatTime(now),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if rows, _ := res.RowsAffected(); rows != 1 {
+			return nil, ErrShardLeaseLost
+		}
+		renewed = append(renewed, ShardLease{
+			ShardID:    leaseToken.ShardID,
+			Owner:      owner,
+			Epoch:      leaseToken.Epoch,
+			LeaseUntil: leaseUntil,
+			UpdatedAt:  now,
+		})
+	}
+
+	if err := commitSQL(ctx, conn); err != nil {
+		return nil, err
+	}
+	committed = true
+	return renewed, nil
+}
+
+func (p *SQLiteProvider) ClaimSignals(ctx context.Context, leases []ShardLease, limit int) ([]SignalRecord, error) {
+	if limit <= 0 || len(leases) == 0 {
+		return nil, nil
+	}
+
+	conn, err := p.db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := beginImmediate(ctx, conn); err != nil {
+		return nil, err
+	}
+	committed := false
+	defer rollbackUnlessCommitted(conn, &committed)
+
+	now := nowUTC()
+	leaseSet, err := currentLeaseSetSQL(ctx, conn, leases, now)
+	if err != nil {
+		return nil, err
+	}
+	if len(leaseSet) == 0 {
+		if err := commitSQL(ctx, conn); err != nil {
+			return nil, err
+		}
+		committed = true
+		return nil, nil
+	}
+
+	placeholders, args := placeholdersForLeaseSet(leaseSet)
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
 		`select id
 		   from machine_signals
 		  where target_shard_id in (%s)
-		    and (status = 'pending'
-		      or (status = 'failed' and (retry_at is null or retry_at <= ?))
-		      or (status = 'processing' and (lease_until is null or lease_until < ?)))
-		  order by created_at, id
-		  limit ?`, strings.Join(placeholders, ",")), args...)
+		    and status in ('pending', 'failed', 'processing')
+		  order by created_at, id`, strings.Join(placeholders, ",")), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -212,18 +357,30 @@ func (p *SQLiteProvider) ClaimSignals(ctx context.Context, owner string, shards 
 		return nil, err
 	}
 
-	leaseUntil := now.Add(lease)
+	claimedIDs := make([]string, 0, minInt(limit, len(ids)))
 	for _, id := range ids {
+		if len(claimedIDs) >= limit {
+			break
+		}
+		signal, err := readSignalSQL(ctx, conn, id)
+		if err != nil {
+			return nil, err
+		}
+		leaseToken := leaseSet[signal.TargetShardID]
+		if !claimableByShardLease(signal.Status, signal.Owner, signal.OwnerEpoch, signal.RetryAt, leaseToken, now) {
+			continue
+		}
 		res, err := conn.ExecContext(ctx,
 			`update machine_signals
 			    set status = 'processing',
 			        owner = ?,
-			        lease_until = ?,
+			        owner_epoch = ?,
+			        lease_until = null,
 			        retry_at = null,
 			        attempts = attempts + 1,
 			        started_at = ?
 			  where id = ?`,
-			owner, formatTime(leaseUntil), formatTime(now), id,
+			leaseToken.Owner, leaseToken.Epoch, formatTime(now), id,
 		)
 		if err != nil {
 			return nil, err
@@ -231,10 +388,11 @@ func (p *SQLiteProvider) ClaimSignals(ctx context.Context, owner string, shards 
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return nil, ErrSignalNotFound
 		}
+		claimedIDs = append(claimedIDs, id)
 	}
 
-	claimed := make([]SignalRecord, 0, len(ids))
-	for _, id := range ids {
+	claimed := make([]SignalRecord, 0, len(claimedIDs))
+	for _, id := range claimedIDs {
 		signal, err := readSignalSQL(ctx, conn, id)
 		if err != nil {
 			return nil, err
@@ -249,15 +407,9 @@ func (p *SQLiteProvider) ClaimSignals(ctx context.Context, owner string, shards 
 	return claimed, nil
 }
 
-func (p *SQLiteProvider) ClaimEntries(ctx context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]Entry, error) {
-	if owner == "" {
-		return nil, fmt.Errorf("durablestateless: owner is required")
-	}
-	if limit <= 0 || len(shards) == 0 {
+func (p *SQLiteProvider) ClaimEntries(ctx context.Context, leases []ShardLease, limit int) ([]Entry, error) {
+	if limit <= 0 || len(leases) == 0 {
 		return nil, nil
-	}
-	if err := validateShardIDs(shards); err != nil {
-		return nil, err
 	}
 
 	conn, err := p.db.Conn(ctx)
@@ -272,14 +424,20 @@ func (p *SQLiteProvider) ClaimEntries(ctx context.Context, owner string, shards 
 	committed := false
 	defer rollbackUnlessCommitted(conn, &committed)
 
-	placeholders := make([]string, len(shards))
-	args := make([]any, 0, len(shards)+2)
-	for i, shard := range shards {
-		placeholders[i] = "?"
-		args = append(args, shard)
-	}
 	now := nowUTC()
-	args = append(args, formatTime(now), formatTime(now), limit)
+	leaseSet, err := currentLeaseSetSQL(ctx, conn, leases, now)
+	if err != nil {
+		return nil, err
+	}
+	if len(leaseSet) == 0 {
+		if err := commitSQL(ctx, conn); err != nil {
+			return nil, err
+		}
+		committed = true
+		return nil, nil
+	}
+
+	placeholders, args := placeholdersForLeaseSet(leaseSet)
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
 		`select e.machine_id, e.version
 		   from machine_entries e
@@ -287,11 +445,8 @@ func (p *SQLiteProvider) ClaimEntries(ctx context.Context, owner string, shards 
 		  where m.shard_id in (%s)
 		    and m.terminal_at is null
 		    and e.version = m.version
-		    and (e.status = 'pending'
-		      or (e.status = 'failed' and (e.retry_at is null or e.retry_at <= ?))
-		      or (e.status = 'processing' and (e.lease_until is null or e.lease_until < ?)))
-		  order by e.created_at, e.machine_id, e.version
-		  limit ?`, strings.Join(placeholders, ",")), args...)
+		    and e.status in ('pending', 'failed', 'processing')
+		  order by e.created_at, e.machine_id, e.version`, strings.Join(placeholders, ",")), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -311,18 +466,30 @@ func (p *SQLiteProvider) ClaimEntries(ctx context.Context, owner string, shards 
 		return nil, err
 	}
 
-	leaseUntil := now.Add(lease)
+	claimedKeys := make([]EntryKey, 0, minInt(limit, len(keys)))
 	for _, key := range keys {
+		if len(claimedKeys) >= limit {
+			break
+		}
+		entry, err := readEntrySQL(ctx, conn, key)
+		if err != nil {
+			return nil, err
+		}
+		leaseToken := leaseSet[entry.ShardID]
+		if !claimableByShardLease(entry.Status, entry.Owner, entry.OwnerEpoch, entry.RetryAt, leaseToken, now) {
+			continue
+		}
 		res, err := conn.ExecContext(ctx,
 			`update machine_entries
 			    set status = 'processing',
 			        owner = ?,
-			        lease_until = ?,
+			        owner_epoch = ?,
+			        lease_until = null,
 			        retry_at = null,
 			        attempts = attempts + 1,
 			        started_at = ?
 			  where machine_id = ? and version = ?`,
-			owner, formatTime(leaseUntil), formatTime(now), key.MachineID, key.Version,
+			leaseToken.Owner, leaseToken.Epoch, formatTime(now), key.MachineID, key.Version,
 		)
 		if err != nil {
 			return nil, err
@@ -330,10 +497,11 @@ func (p *SQLiteProvider) ClaimEntries(ctx context.Context, owner string, shards 
 		if rows, _ := res.RowsAffected(); rows != 1 {
 			return nil, ErrEntryNotFound
 		}
+		claimedKeys = append(claimedKeys, key)
 	}
 
-	claimed := make([]Entry, 0, len(keys))
-	for _, key := range keys {
+	claimed := make([]Entry, 0, len(claimedKeys))
+	for _, key := range claimedKeys {
 		entry, err := readEntrySQL(ctx, conn, key)
 		if err != nil {
 			return nil, err
@@ -362,12 +530,12 @@ func (p *SQLiteProvider) Commit(ctx context.Context, cmd AtomicCommit) (*CommitR
 	defer rollbackUnlessCommitted(conn, &committed)
 
 	if cmd.CompleteSignal != nil {
-		if err := completeSignalSQL(ctx, conn, cmd.CompleteSignal.ID, cmd.CompleteSignal.Owner, cmd.CompleteSignal.Attempt); err != nil {
+		if err := completeSignalSQL(ctx, conn, cmd.CompleteSignal.ID, cmd.CompleteSignal.Owner, cmd.CompleteSignal.OwnerEpoch, cmd.CompleteSignal.Attempt); err != nil {
 			return nil, err
 		}
 	}
 	if cmd.CompleteEntry != nil {
-		if err := completeEntrySQL(ctx, conn, cmd.CompleteEntry.Key, cmd.CompleteEntry.Owner, cmd.CompleteEntry.Attempt); err != nil {
+		if err := completeEntrySQL(ctx, conn, cmd.CompleteEntry.Key, cmd.CompleteEntry.Owner, cmd.CompleteEntry.OwnerEpoch, cmd.CompleteEntry.Attempt); err != nil {
 			return nil, err
 		}
 	}
@@ -398,20 +566,12 @@ func (p *SQLiteProvider) Commit(ctx context.Context, cmd AtomicCommit) (*CommitR
 	}, nil
 }
 
-func (p *SQLiteProvider) RenewSignalLease(ctx context.Context, id string, owner string, attempt int, lease time.Duration) error {
-	return renewSignalLeaseSQL(ctx, p.db, id, owner, attempt, lease)
+func (p *SQLiteProvider) FailEntry(ctx context.Context, key EntryKey, owner string, ownerEpoch int64, attempt int, failure Failure) error {
+	return failEntrySQL(ctx, p.db, key, owner, ownerEpoch, attempt, failure)
 }
 
-func (p *SQLiteProvider) RenewEntryLease(ctx context.Context, key EntryKey, owner string, attempt int, lease time.Duration) error {
-	return renewEntryLeaseSQL(ctx, p.db, key, owner, attempt, lease)
-}
-
-func (p *SQLiteProvider) FailEntry(ctx context.Context, key EntryKey, owner string, attempt int, failure Failure) error {
-	return failEntrySQL(ctx, p.db, key, owner, attempt, failure)
-}
-
-func (p *SQLiteProvider) FailSignal(ctx context.Context, id string, owner string, attempt int, failure Failure) error {
-	return failSignalSQL(ctx, p.db, id, owner, attempt, failure)
+func (p *SQLiteProvider) FailSignal(ctx context.Context, id string, owner string, ownerEpoch int64, attempt int, failure Failure) error {
+	return failSignalSQL(ctx, p.db, id, owner, ownerEpoch, attempt, failure)
 }
 
 type sqlRunner interface {
@@ -461,6 +621,83 @@ func addColumnIfMissing(ctx context.Context, db *sql.DB, table string, column st
 	}
 	_, err = db.ExecContext(ctx, fmt.Sprintf(`alter table %s add column %s %s`, table, column, definition))
 	return err
+}
+
+func readShardLeaseSQL(ctx context.Context, q sqlRunner, shard ShardID) (*ShardLease, error) {
+	row := q.QueryRowContext(ctx,
+		`select shard_id, owner, epoch, lease_until, updated_at
+		   from shard_leases
+		  where shard_id = ?`, shard)
+
+	var lease ShardLease
+	var rawShard int
+	var leaseUntilRaw, updatedRaw string
+	if err := row.Scan(&rawShard, &lease.Owner, &lease.Epoch, &leaseUntilRaw, &updatedRaw); err != nil {
+		return nil, err
+	}
+	leaseUntil, err := parseRequiredTime(leaseUntilRaw)
+	if err != nil {
+		return nil, err
+	}
+	updatedAt, err := parseRequiredTime(updatedRaw)
+	if err != nil {
+		return nil, err
+	}
+	lease.ShardID = ShardID(rawShard)
+	lease.LeaseUntil = leaseUntil
+	lease.UpdatedAt = updatedAt
+	return &lease, nil
+}
+
+func currentLeaseSetSQL(ctx context.Context, q sqlRunner, leases []ShardLease, now time.Time) (map[ShardID]ShardLease, error) {
+	leaseSet := make(map[ShardID]ShardLease, len(leases))
+	for _, leaseToken := range leases {
+		current, err := readShardLeaseSQL(ctx, q, leaseToken.ShardID)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if current.Owner == leaseToken.Owner && current.Epoch == leaseToken.Epoch && current.LeaseUntil.After(now) {
+			leaseSet[current.ShardID] = *current
+		}
+	}
+	return leaseSet, nil
+}
+
+func shardLeaseOwnedSQL(ctx context.Context, q sqlRunner, shard ShardID, owner string, epoch int64, now time.Time) (bool, error) {
+	var count int
+	err := q.QueryRowContext(ctx,
+		`select count(*)
+		   from shard_leases
+		  where shard_id = ?
+		    and owner = ?
+		    and epoch = ?
+		    and lease_until > ?`,
+		shard, owner, epoch, formatTime(now),
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count == 1, nil
+}
+
+func placeholdersForLeaseSet(leaseSet map[ShardID]ShardLease) ([]string, []any) {
+	placeholders := make([]string, 0, len(leaseSet))
+	args := make([]any, 0, len(leaseSet))
+	for shard := range leaseSet {
+		placeholders = append(placeholders, "?")
+		args = append(args, shard)
+	}
+	return placeholders, args
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func enqueueSignalSQL(ctx context.Context, q sqlRunner, signal SignalRecord) error {
@@ -657,7 +894,7 @@ func readEntrySQL(ctx context.Context, q sqlRunner, key EntryKey) (*Entry, error
 	row := q.QueryRowContext(ctx,
 		`select e.machine_id, e.version, m.shard_id,
 		        e.source_state, e.dest_state, e.trigger, e.args_json,
-		        e.status, coalesce(e.owner, ''), e.lease_until, e.retry_at, e.attempts,
+		        e.status, coalesce(e.owner, ''), e.owner_epoch, e.lease_until, e.retry_at, e.attempts,
 		        e.created_at, e.started_at, e.completed_at, coalesce(e.last_error, '')
 		   from machine_entries e
 		   join machines m on m.id = e.machine_id
@@ -672,7 +909,7 @@ func readEntrySQL(ctx context.Context, q sqlRunner, key EntryKey) (*Entry, error
 	err := row.Scan(
 		&entry.Key.MachineID, &entry.Key.Version, &shard,
 		&source, &dest, &trigger, &argsJSON,
-		&entry.Status, &entry.Owner, &leaseRaw, &retryRaw, &entry.Attempts,
+		&entry.Status, &entry.Owner, &entry.OwnerEpoch, &leaseRaw, &retryRaw, &entry.Attempts,
 		&createdRaw, &startedRaw, &completedRaw, &entry.LastError,
 	)
 	if err == sql.ErrNoRows {
@@ -721,7 +958,7 @@ func readEntrySQL(ctx context.Context, q sqlRunner, key EntryKey) (*Entry, error
 func readSignalSQL(ctx context.Context, q sqlRunner, id string) (*SignalRecord, error) {
 	row := q.QueryRowContext(ctx,
 		`select id, machine_id, target_shard_id, trigger, args_json,
-		        status, coalesce(owner, ''), lease_until, retry_at, attempts,
+		        status, coalesce(owner, ''), owner_epoch, lease_until, retry_at, attempts,
 		        created_at, started_at, completed_at, coalesce(last_error, '')
 		   from machine_signals
 		  where id = ?`, id)
@@ -734,7 +971,7 @@ func readSignalSQL(ctx context.Context, q sqlRunner, id string) (*SignalRecord, 
 	var createdRaw string
 	err := row.Scan(
 		&signal.ID, &signal.MachineID, &shard, &trigger, &argsJSON,
-		&signal.Status, &signal.Owner, &leaseRaw, &retryRaw, &signal.Attempts,
+		&signal.Status, &signal.Owner, &signal.OwnerEpoch, &leaseRaw, &retryRaw, &signal.Attempts,
 		&createdRaw, &startedRaw, &completedRaw, &signal.LastError,
 	)
 	if err == sql.ErrNoRows {
@@ -778,7 +1015,7 @@ func readSignalSQL(ctx context.Context, q sqlRunner, id string) (*SignalRecord, 
 	return &signal, nil
 }
 
-func completeEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, attempt int) error {
+func completeEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, ownerEpoch int64, attempt int) error {
 	now := nowUTC()
 	res, err := q.ExecContext(ctx,
 		`update machine_entries
@@ -790,8 +1027,19 @@ func completeEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner stri
 		    and version = ?
 		    and status = 'processing'
 		    and owner = ?
-		    and attempts = ?`,
-		formatTime(now), key.MachineID, key.Version, owner, attempt,
+		    and owner_epoch = ?
+		    and attempts = ?
+		    and exists (
+		    	select 1
+		    	  from machines m
+		    	  join shard_leases l on l.shard_id = m.shard_id
+		    	 where m.id = machine_entries.machine_id
+		    	   and l.owner = ?
+		    	   and l.epoch = ?
+		    	   and l.lease_until > ?
+		    )`,
+		formatTime(now), key.MachineID, key.Version, owner, ownerEpoch, attempt,
+		owner, ownerEpoch, formatTime(now),
 	)
 	if err != nil {
 		return err
@@ -799,10 +1047,10 @@ func completeEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner stri
 	if rows, _ := res.RowsAffected(); rows == 1 {
 		return nil
 	}
-	return resolveEntryCompleteMiss(ctx, q, key, owner, attempt, true)
+	return resolveEntryCompleteMiss(ctx, q, key, owner, ownerEpoch, attempt, true)
 }
 
-func completeSignalSQL(ctx context.Context, q sqlRunner, id string, owner string, attempt int) error {
+func completeSignalSQL(ctx context.Context, q sqlRunner, id string, owner string, ownerEpoch int64, attempt int) error {
 	now := nowUTC()
 	res, err := q.ExecContext(ctx,
 		`update machine_signals
@@ -813,8 +1061,17 @@ func completeSignalSQL(ctx context.Context, q sqlRunner, id string, owner string
 		  where id = ?
 		    and status = 'processing'
 		    and owner = ?
-		    and attempts = ?`,
-		formatTime(now), id, owner, attempt,
+		    and owner_epoch = ?
+		    and attempts = ?
+		    and exists (
+		    	select 1
+		    	  from shard_leases l
+		    	 where l.shard_id = machine_signals.target_shard_id
+		    	   and l.owner = ?
+		    	   and l.epoch = ?
+		    	   and l.lease_until > ?
+		    )`,
+		formatTime(now), id, owner, ownerEpoch, attempt, owner, ownerEpoch, formatTime(now),
 	)
 	if err != nil {
 		return err
@@ -822,51 +1079,10 @@ func completeSignalSQL(ctx context.Context, q sqlRunner, id string, owner string
 	if rows, _ := res.RowsAffected(); rows == 1 {
 		return nil
 	}
-	return resolveSignalCompleteMiss(ctx, q, id, owner, attempt, true)
+	return resolveSignalCompleteMiss(ctx, q, id, owner, ownerEpoch, attempt, true)
 }
 
-func renewEntryLeaseSQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, attempt int, lease time.Duration) error {
-	leaseUntil := nowUTC().Add(lease)
-	res, err := q.ExecContext(ctx,
-		`update machine_entries
-		    set lease_until = ?
-		  where machine_id = ?
-		    and version = ?
-		    and status = 'processing'
-		    and owner = ?
-		    and attempts = ?`,
-		formatTime(leaseUntil), key.MachineID, key.Version, owner, attempt,
-	)
-	if err != nil {
-		return err
-	}
-	if rows, _ := res.RowsAffected(); rows == 1 {
-		return nil
-	}
-	return resolveEntryCompleteMiss(ctx, q, key, owner, attempt, false)
-}
-
-func renewSignalLeaseSQL(ctx context.Context, q sqlRunner, id string, owner string, attempt int, lease time.Duration) error {
-	leaseUntil := nowUTC().Add(lease)
-	res, err := q.ExecContext(ctx,
-		`update machine_signals
-		    set lease_until = ?
-		  where id = ?
-		    and status = 'processing'
-		    and owner = ?
-		    and attempts = ?`,
-		formatTime(leaseUntil), id, owner, attempt,
-	)
-	if err != nil {
-		return err
-	}
-	if rows, _ := res.RowsAffected(); rows == 1 {
-		return nil
-	}
-	return resolveSignalCompleteMiss(ctx, q, id, owner, attempt, false)
-}
-
-func failEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, attempt int, failure Failure) error {
+func failEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, ownerEpoch int64, attempt int, failure Failure) error {
 	message := ""
 	if failure.Cause != nil {
 		message = failure.Cause.Error()
@@ -881,6 +1097,7 @@ func failEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, 
 		`update machine_entries
 		    set status = ?,
 		        owner = null,
+		        owner_epoch = 0,
 		        lease_until = null,
 		        retry_at = ?,
 		        last_error = ?
@@ -888,8 +1105,19 @@ func failEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, 
 		    and version = ?
 		    and status = 'processing'
 		    and owner = ?
-		    and attempts = ?`,
-		status, retryAt, message, key.MachineID, key.Version, owner, attempt,
+		    and owner_epoch = ?
+		    and attempts = ?
+		    and exists (
+		    	select 1
+		    	  from machines m
+		    	  join shard_leases l on l.shard_id = m.shard_id
+		    	 where m.id = machine_entries.machine_id
+		    	   and l.owner = ?
+		    	   and l.epoch = ?
+		    	   and l.lease_until > ?
+		    )`,
+		status, retryAt, message, key.MachineID, key.Version, owner, ownerEpoch, attempt,
+		owner, ownerEpoch, formatTime(nowUTC()),
 	)
 	if err != nil {
 		return err
@@ -897,10 +1125,10 @@ func failEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, 
 	if rows, _ := res.RowsAffected(); rows == 1 {
 		return nil
 	}
-	return resolveEntryCompleteMiss(ctx, q, key, owner, attempt, false)
+	return resolveEntryCompleteMiss(ctx, q, key, owner, ownerEpoch, attempt, false)
 }
 
-func failSignalSQL(ctx context.Context, q sqlRunner, id string, owner string, attempt int, failure Failure) error {
+func failSignalSQL(ctx context.Context, q sqlRunner, id string, owner string, ownerEpoch int64, attempt int, failure Failure) error {
 	message := ""
 	if failure.Cause != nil {
 		message = failure.Cause.Error()
@@ -915,14 +1143,24 @@ func failSignalSQL(ctx context.Context, q sqlRunner, id string, owner string, at
 		`update machine_signals
 		    set status = ?,
 		        owner = null,
+		        owner_epoch = 0,
 		        lease_until = null,
 		        retry_at = ?,
 		        last_error = ?
 		  where id = ?
 		    and status = 'processing'
 		    and owner = ?
-		    and attempts = ?`,
-		status, retryAt, message, id, owner, attempt,
+		    and owner_epoch = ?
+		    and attempts = ?
+		    and exists (
+		    	select 1
+		    	  from shard_leases l
+		    	 where l.shard_id = machine_signals.target_shard_id
+		    	   and l.owner = ?
+		    	   and l.epoch = ?
+		    	   and l.lease_until > ?
+		    )`,
+		status, retryAt, message, id, owner, ownerEpoch, attempt, owner, ownerEpoch, formatTime(nowUTC()),
 	)
 	if err != nil {
 		return err
@@ -930,50 +1168,77 @@ func failSignalSQL(ctx context.Context, q sqlRunner, id string, owner string, at
 	if rows, _ := res.RowsAffected(); rows == 1 {
 		return nil
 	}
-	return resolveSignalCompleteMiss(ctx, q, id, owner, attempt, false)
+	return resolveSignalCompleteMiss(ctx, q, id, owner, ownerEpoch, attempt, false)
 }
 
-func resolveEntryCompleteMiss(ctx context.Context, q sqlRunner, key EntryKey, requestedOwner string, requestedAttempt int, allowDone bool) error {
+func resolveEntryCompleteMiss(ctx context.Context, q sqlRunner, key EntryKey, requestedOwner string, requestedOwnerEpoch int64, requestedAttempt int, allowDone bool) error {
 	var status EntryStatus
 	var owner string
+	var ownerEpoch int64
 	var attempt int
+	var shard int
 	err := q.QueryRowContext(ctx,
-		`select status, coalesce(owner, ''), attempts from machine_entries where machine_id = ? and version = ?`,
+		`select e.status, coalesce(e.owner, ''), e.owner_epoch, e.attempts, m.shard_id
+		   from machine_entries e
+		   join machines m on m.id = e.machine_id
+		  where e.machine_id = ? and e.version = ?`,
 		key.MachineID, key.Version,
-	).Scan(&status, &owner, &attempt)
+	).Scan(&status, &owner, &ownerEpoch, &attempt, &shard)
 	if err == sql.ErrNoRows {
 		return ErrEntryNotFound
 	}
 	if err != nil {
 		return err
 	}
-	if status == EntryDone && allowDone && owner == requestedOwner && attempt == requestedAttempt {
+	if status == EntryDone && allowDone && owner == requestedOwner && ownerEpoch == requestedOwnerEpoch && attempt == requestedAttempt {
 		return nil
 	}
 	if status == EntryDeadLettered {
 		return ErrWorkDeadLettered
 	}
+	if status == EntryProcessing && owner == requestedOwner && ownerEpoch == requestedOwnerEpoch && attempt == requestedAttempt {
+		owned, err := shardLeaseOwnedSQL(ctx, q, ShardID(shard), requestedOwner, requestedOwnerEpoch, nowUTC())
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrShardLeaseLost
+		}
+	}
 	return ErrEntryNotOwned
 }
 
-func resolveSignalCompleteMiss(ctx context.Context, q sqlRunner, id string, requestedOwner string, requestedAttempt int, allowDone bool) error {
+func resolveSignalCompleteMiss(ctx context.Context, q sqlRunner, id string, requestedOwner string, requestedOwnerEpoch int64, requestedAttempt int, allowDone bool) error {
 	var status EntryStatus
 	var owner string
+	var ownerEpoch int64
 	var attempt int
+	var shard int
 	err := q.QueryRowContext(ctx,
-		`select status, coalesce(owner, ''), attempts from machine_signals where id = ?`, id,
-	).Scan(&status, &owner, &attempt)
+		`select status, coalesce(owner, ''), owner_epoch, attempts, target_shard_id
+		   from machine_signals
+		  where id = ?`, id,
+	).Scan(&status, &owner, &ownerEpoch, &attempt, &shard)
 	if err == sql.ErrNoRows {
 		return ErrSignalNotFound
 	}
 	if err != nil {
 		return err
 	}
-	if status == EntryDone && allowDone && owner == requestedOwner && attempt == requestedAttempt {
+	if status == EntryDone && allowDone && owner == requestedOwner && ownerEpoch == requestedOwnerEpoch && attempt == requestedAttempt {
 		return nil
 	}
 	if status == EntryDeadLettered {
 		return ErrWorkDeadLettered
+	}
+	if status == EntryProcessing && owner == requestedOwner && ownerEpoch == requestedOwnerEpoch && attempt == requestedAttempt {
+		owned, err := shardLeaseOwnedSQL(ctx, q, ShardID(shard), requestedOwner, requestedOwnerEpoch, nowUTC())
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return ErrShardLeaseLost
+		}
 	}
 	return ErrSignalNotOwned
 }

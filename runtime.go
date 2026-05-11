@@ -21,17 +21,17 @@ func WithSharder(sharder Sharder) Option {
 	}
 }
 
-// WithLeaseDuration configures how long claimed signals and entries are leased
-// to a worker before another worker may retry them.
+// WithLeaseDuration configures how long a worker owns its shard leases before
+// another worker may acquire those shards.
 func WithLeaseDuration(lease time.Duration) Option {
 	return func(r *Runtime) {
 		r.lease = lease
 	}
 }
 
-// WithLeaseRenewalInterval configures how often workers renew entry-handler
-// leases. A zero interval derives from the lease duration; a negative interval
-// disables automatic renewal.
+// WithLeaseRenewalInterval configures how often workers renew shard leases. A
+// zero interval derives from the lease duration; a negative interval disables
+// automatic renewal.
 func WithLeaseRenewalInterval(interval time.Duration) Option {
 	return func(r *Runtime) {
 		r.renewInterval = interval
@@ -123,7 +123,7 @@ func (r *Runtime) Signal(ctx context.Context, signal Signal) error {
 // Worker creates a shard worker view over this runtime.
 func (r *Runtime) Worker(config WorkerConfig) *Worker {
 	lease := r.lease
-	if lease == 0 {
+	if lease <= 0 {
 		lease = DefaultLeaseDuration
 	}
 	renewInterval := r.renewInterval
@@ -271,7 +271,8 @@ type WorkerConfig struct {
 	Shards []ShardID
 }
 
-// Worker claims and processes durable signals and entry work for owned shards.
+// Worker claims shard leases and processes durable signals and entry work for
+// those owned shards.
 type Worker struct {
 	runtime       *Runtime
 	id            string
@@ -282,8 +283,8 @@ type Worker struct {
 
 // Work processes up to limit successful units of work for the worker's shards.
 // A unit is either a completed signal or a completed entry handler. Work first
-// recovers unfinished entries, then applies signals, then processes entries
-// created by those signals.
+// acquires shard leases, renews them while it runs, recovers unfinished entries,
+// applies signals, then processes entries created by those signals.
 func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 	if err := w.validate(); err != nil {
 		return 0, err
@@ -292,20 +293,35 @@ func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 		return 0, nil
 	}
 
+	leases, err := w.runtime.provider.AcquireShardLeases(ctx, w.id, w.shards, w.lease)
+	if err != nil {
+		return 0, err
+	}
+	if len(leases) == 0 {
+		return 0, nil
+	}
+	workCtx, stopRenewal := w.renewShardLeasesWhileWorking(ctx, leases)
+
 	processed := 0
 	var errs []error
 	hadEntryError := false
+	finish := func(err error) (int, error) {
+		if stopErr := stopRenewal(); stopErr != nil {
+			err = errors.Join(err, stopErr)
+		}
+		return processed, err
+	}
 
 	processEntries := func(available int) error {
 		if available <= 0 {
 			return nil
 		}
-		entries, err := w.runtime.provider.ClaimEntries(ctx, w.id, w.shards, available, w.lease)
+		entries, err := w.runtime.provider.ClaimEntries(workCtx, leases, available)
 		if err != nil {
 			return err
 		}
 		for _, entry := range entries {
-			if err := w.processEntry(ctx, entry); err != nil {
+			if err := w.processEntry(workCtx, entry); err != nil {
 				hadEntryError = true
 				errs = append(errs, err)
 				continue
@@ -319,12 +335,12 @@ func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 		if available <= 0 {
 			return nil
 		}
-		signals, err := w.runtime.provider.ClaimSignals(ctx, w.id, w.shards, available, w.lease)
+		signals, err := w.runtime.provider.ClaimSignals(workCtx, leases, available)
 		if err != nil {
 			return err
 		}
 		for _, signal := range signals {
-			if err := w.processSignal(ctx, signal); err != nil {
+			if err := w.processSignal(workCtx, signal); err != nil {
 				errs = append(errs, err)
 				continue
 			}
@@ -334,20 +350,20 @@ func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 	}
 
 	if err := processEntries(limit - processed); err != nil {
-		return processed, err
+		return finish(err)
 	}
 	if err := processSignals(limit - processed); err != nil {
 		errs = append(errs, err)
-		return processed, errors.Join(errs...)
+		return finish(errors.Join(errs...))
 	}
 	if !hadEntryError {
 		if err := processEntries(limit - processed); err != nil {
 			errs = append(errs, err)
-			return processed, errors.Join(errs...)
+			return finish(errors.Join(errs...))
 		}
 	}
 
-	return processed, errors.Join(errs...)
+	return finish(errors.Join(errs...))
 }
 
 func (w *Worker) processSignal(ctx context.Context, signal SignalRecord) error {
@@ -360,25 +376,26 @@ func (w *Worker) processSignal(ctx context.Context, signal SignalRecord) error {
 
 	snap, err := w.runtime.provider.ReadMachine(ctx, signal.MachineID)
 	if err != nil {
-		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, w.runtime.failure(signal.Attempts, err))
+		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.OwnerEpoch, signal.Attempts, w.runtime.failure(signal.Attempts, err))
 		return err
 	}
 	if !w.owns(snap.ShardID) {
 		err := fmt.Errorf("%w: machine %s is on shard %d", ErrWrongShard, snap.ID, snap.ShardID)
-		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, w.runtime.failure(signal.Attempts, err))
+		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.OwnerEpoch, signal.Attempts, w.runtime.failure(signal.Attempts, err))
 		return err
 	}
 
 	commit := AtomicCommit{
 		CompleteSignal: &CompleteSignalCommand{
-			ID:      signal.ID,
-			Owner:   signal.Owner,
-			Attempt: signal.Attempts,
+			ID:         signal.ID,
+			Owner:      signal.Owner,
+			OwnerEpoch: signal.OwnerEpoch,
+			Attempt:    signal.Attempts,
 		},
 	}
 	cmd, err := w.runtime.buildCommit(ctx, snap, signal.Trigger, signal.Args...)
 	if err != nil {
-		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, w.runtime.failure(signal.Attempts, err))
+		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.OwnerEpoch, signal.Attempts, w.runtime.failure(signal.Attempts, err))
 		return err
 	}
 	if cmd != nil {
@@ -388,7 +405,7 @@ func (w *Worker) processSignal(ctx context.Context, signal SignalRecord) error {
 	_, err = w.runtime.provider.Commit(ctx, commit)
 	if err != nil {
 		if shouldFailClaimedWork(err) {
-			_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, w.runtime.failure(signal.Attempts, err))
+			_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.OwnerEpoch, signal.Attempts, w.runtime.failure(signal.Attempts, err))
 		}
 		return err
 	}
@@ -404,7 +421,7 @@ func (w *Worker) processEntry(ctx context.Context, entry Entry) error {
 	}
 	if !w.owns(entry.ShardID) {
 		err := fmt.Errorf("%w: machine %s is on shard %d", ErrWrongShard, entry.Key.MachineID, entry.ShardID)
-		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
+		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.OwnerEpoch, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		return err
 	}
 
@@ -412,53 +429,50 @@ func (w *Worker) processEntry(ctx context.Context, entry Entry) error {
 	if !ok {
 		_, err := w.runtime.provider.Commit(ctx, AtomicCommit{
 			CompleteEntry: &CompleteEntryCommand{
-				Key:     entry.Key,
-				Owner:   entry.Owner,
-				Attempt: entry.Attempts,
+				Key:        entry.Key,
+				Owner:      entry.Owner,
+				OwnerEpoch: entry.OwnerEpoch,
+				Attempt:    entry.Attempts,
 			},
 		})
 		return err
 	}
 	if handler == nil {
 		err := fmt.Errorf("%w for state %v", ErrNilEntryHandler, entry.DestState)
-		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
+		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.OwnerEpoch, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		return err
 	}
 
-	handlerCtx, stopRenewal := w.renewEntryLeaseWhileProcessing(ctx, entry)
-	result, err := handler(handlerCtx, entry)
-	renewErr := stopRenewal()
-	if renewErr != nil {
-		return renewErr
-	}
+	result, err := handler(ctx, entry)
 	if err != nil {
-		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
+		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.OwnerEpoch, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		return err
 	}
 
 	records, err := w.runtime.prepareSignals(ctx, result.Signals)
 	if err != nil {
-		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
+		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.OwnerEpoch, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		return err
 	}
 
 	commit := AtomicCommit{
 		CompleteEntry: &CompleteEntryCommand{
-			Key:     entry.Key,
-			Owner:   entry.Owner,
-			Attempt: entry.Attempts,
+			Key:        entry.Key,
+			Owner:      entry.Owner,
+			OwnerEpoch: entry.OwnerEpoch,
+			Attempt:    entry.Attempts,
 		},
 		Signals: records,
 	}
 	if result.Next != nil {
 		snap, err := w.runtime.provider.ReadMachine(ctx, entry.Key.MachineID)
 		if err != nil {
-			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
+			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.OwnerEpoch, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 			return err
 		}
 		cmd, err := w.runtime.buildCommit(ctx, snap, result.Next.Trigger, result.Next.Args...)
 		if err != nil {
-			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
+			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.OwnerEpoch, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 			return err
 		}
 		commit.Transition = cmd
@@ -467,33 +481,35 @@ func (w *Worker) processEntry(ctx context.Context, entry Entry) error {
 	_, err = w.runtime.provider.Commit(ctx, commit)
 	if err != nil {
 		if shouldFailClaimedWork(err) {
-			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
+			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.OwnerEpoch, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		}
 		return err
 	}
 	return nil
 }
 
-func (w *Worker) renewEntryLeaseWhileProcessing(ctx context.Context, entry Entry) (context.Context, func() error) {
+func (w *Worker) renewShardLeasesWhileWorking(ctx context.Context, leases []ShardLease) (context.Context, func() error) {
 	if w.lease <= 0 || w.renewInterval <= 0 {
 		return ctx, func() error { return nil }
 	}
 
-	handlerCtx, cancel := context.WithCancel(ctx)
+	workCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
+	stopped := make(chan struct{})
 
 	go func() {
+		defer close(stopped)
 		ticker := time.NewTicker(w.renewInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
 				return
-			case <-handlerCtx.Done():
+			case <-workCtx.Done():
 				return
 			case <-ticker.C:
-				if err := w.runtime.provider.RenewEntryLease(ctx, entry.Key, entry.Owner, entry.Attempts, w.lease); err != nil {
+				if _, err := w.runtime.provider.RenewShardLeases(ctx, w.id, leases, w.lease); err != nil {
 					select {
 					case errCh <- err:
 					default:
@@ -505,9 +521,20 @@ func (w *Worker) renewEntryLeaseWhileProcessing(ctx context.Context, entry Entry
 		}
 	}()
 
-	return handlerCtx, func() error {
+	called := false
+	return workCtx, func() error {
+		if called {
+			select {
+			case err := <-errCh:
+				return err
+			default:
+				return nil
+			}
+		}
+		called = true
 		close(done)
 		cancel()
+		<-stopped
 		select {
 		case err := <-errCh:
 			return err
@@ -546,7 +573,11 @@ func (w *Worker) validate() error {
 }
 
 func shouldFailClaimedWork(err error) bool {
-	return !errors.Is(err, ErrEntryInProgress) && !errors.Is(err, ErrVersionConflict)
+	return !errors.Is(err, ErrEntryInProgress) &&
+		!errors.Is(err, ErrVersionConflict) &&
+		!errors.Is(err, ErrShardLeaseLost) &&
+		!errors.Is(err, ErrEntryNotOwned) &&
+		!errors.Is(err, ErrSignalNotOwned)
 }
 
 func (r *Runtime) failure(attempt int, cause error) Failure {

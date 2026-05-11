@@ -171,7 +171,7 @@ func TestSignalInvalidTriggerDoesNotMutateState(t *testing.T) {
 			if snap.State != stateIdle || snap.Version != 0 || snap.Terminal() {
 				t.Fatalf("unexpected snapshot after failed signal: %+v", snap)
 			}
-			signals := claimSignals(t, ctx, provider, "inspector", 7, 10, time.Second)
+			signals := claimSignals(t, ctx, provider, "worker", 7, 10, time.Second)
 			if len(signals) != 1 || signals[0].Status != EntryProcessing || signals[0].LastError == "" {
 				t.Fatalf("expected failed signal to be claimable with error, got %+v", signals)
 			}
@@ -266,13 +266,14 @@ func TestLazyRecoveryRetriesSameEntryKeyAfterCrash(t *testing.T) {
 			createMachine(t, ctx, rt, "m1", 4, stateIdle)
 			processSignal(t, ctx, rt, provider, "worker-a", 4, NewSignal("s1", "m1", triggerStart))
 
-			claimed := claimEntries(t, ctx, provider, "worker-a", 4, 1, -time.Second)
+			claimed := claimEntries(t, ctx, provider, "worker-a", 4, 1, 20*time.Millisecond)
 			if len(claimed) != 1 {
 				t.Fatalf("expected one claimed entry, got %d", len(claimed))
 			}
 			if _, err := handler(ctx, claimed[0]); err != nil {
 				t.Fatalf("simulate handler side effect: %v", err)
 			}
+			time.Sleep(40 * time.Millisecond)
 
 			processed, err := rt.Worker(WorkerConfig{ID: "worker-b", Shards: []ShardID{4}}).Work(ctx, 10)
 			if err != nil {
@@ -320,7 +321,7 @@ func TestEntryCompletionAndNextTriggerAreAtomic(t *testing.T) {
 			if snap.State != stateWorking || snap.Version != 1 || snap.Terminal() {
 				t.Fatalf("completion should have rolled back with next trigger: %+v", snap)
 			}
-			reclaimed := claimEntries(t, ctx, provider, "inspector", 5, 10, time.Second)
+			reclaimed := claimEntries(t, ctx, provider, "worker", 5, 10, time.Second)
 			if len(reclaimed) != 1 || reclaimed[0].Attempts != 2 {
 				t.Fatalf("expected failed entry to be claimable, got %+v", reclaimed)
 			}
@@ -417,12 +418,12 @@ func TestCommitUsesExpectedVersionAndRollsBackCompletions(t *testing.T) {
 			}
 
 			processSignal(t, ctx, rt, provider, "worker", 16, NewSignal("s1", "m1", triggerStart))
-			claimed := claimEntries(t, ctx, provider, "worker", 16, 1, -time.Second)
+			claimed := claimEntries(t, ctx, provider, "worker", 16, 1, 20*time.Millisecond)
 			if len(claimed) != 1 {
 				t.Fatalf("expected one claimed entry, got %+v", claimed)
 			}
 			_, err = provider.Commit(ctx, AtomicCommit{
-				CompleteEntry: &CompleteEntryCommand{Key: claimed[0].Key, Owner: "worker", Attempt: claimed[0].Attempts},
+				CompleteEntry: &CompleteEntryCommand{Key: claimed[0].Key, Owner: "worker", OwnerEpoch: claimed[0].OwnerEpoch, Attempt: claimed[0].Attempts},
 				Transition: &CommitTransition{
 					MachineID:       "m1",
 					ExpectedVersion: 0,
@@ -437,7 +438,8 @@ func TestCommitUsesExpectedVersionAndRollsBackCompletions(t *testing.T) {
 			if !errors.Is(err, ErrVersionConflict) {
 				t.Fatalf("expected version conflict, got %v", err)
 			}
-			reclaimed := claimEntries(t, ctx, provider, "worker-2", 16, 1, -time.Second)
+			time.Sleep(40 * time.Millisecond)
+			reclaimed := claimEntries(t, ctx, provider, "worker-2", 16, 1, time.Second)
 			if len(reclaimed) != 1 || reclaimed[0].Key != claimed[0].Key {
 				t.Fatalf("entry completion should roll back with failed transition, got %+v", reclaimed)
 			}
@@ -469,24 +471,28 @@ func TestStaleEntryOwnerCannotCommitAfterLeaseIsStolen(t *testing.T) {
 				t.Fatalf("seed entry: %v", err)
 			}
 
-			claimedA := claimEntries(t, ctx, provider, "worker", 17, 1, -time.Second)
+			claimedA := claimEntries(t, ctx, provider, "worker", 17, 1, 20*time.Millisecond)
 			if len(claimedA) != 1 {
 				t.Fatalf("expected first claim, got %+v", claimedA)
 			}
+			time.Sleep(40 * time.Millisecond)
 			claimedB := claimEntries(t, ctx, provider, "worker", 17, 1, time.Second)
 			if len(claimedB) != 1 || claimedB[0].Key != claimedA[0].Key {
-				t.Fatalf("expected same owner to reclaim expired lease, got %+v", claimedB)
+				t.Fatalf("expected same owner to reclaim with new shard epoch, got %+v", claimedB)
+			}
+			if claimedB[0].OwnerEpoch == claimedA[0].OwnerEpoch {
+				t.Fatalf("expected shard epoch to advance after lease expiry: first=%+v second=%+v", claimedA[0], claimedB[0])
 			}
 
 			_, err = provider.Commit(ctx, AtomicCommit{
-				CompleteEntry: &CompleteEntryCommand{Key: claimedB[0].Key, Owner: "worker", Attempt: claimedB[0].Attempts},
+				CompleteEntry: &CompleteEntryCommand{Key: claimedB[0].Key, Owner: "worker", OwnerEpoch: claimedB[0].OwnerEpoch, Attempt: claimedB[0].Attempts},
 			})
 			if err != nil {
 				t.Fatalf("complete with second claim: %v", err)
 			}
 
 			_, err = provider.Commit(ctx, AtomicCommit{
-				CompleteEntry: &CompleteEntryCommand{Key: claimedA[0].Key, Owner: "worker", Attempt: claimedA[0].Attempts},
+				CompleteEntry: &CompleteEntryCommand{Key: claimedA[0].Key, Owner: "worker", OwnerEpoch: claimedA[0].OwnerEpoch, Attempt: claimedA[0].Attempts},
 				Transition: &CommitTransition{
 					MachineID:       "m1",
 					ExpectedVersion: 1,
@@ -521,24 +527,28 @@ func TestStaleSignalOwnerCannotCommitAfterLeaseIsStolen(t *testing.T) {
 				t.Fatalf("signal: %v", err)
 			}
 
-			claimedA := claimSignals(t, ctx, provider, "worker", 18, 1, -time.Second)
+			claimedA := claimSignals(t, ctx, provider, "worker", 18, 1, 20*time.Millisecond)
 			if len(claimedA) != 1 {
 				t.Fatalf("expected first signal claim, got %+v", claimedA)
 			}
+			time.Sleep(40 * time.Millisecond)
 			claimedB := claimSignals(t, ctx, provider, "worker", 18, 1, time.Second)
 			if len(claimedB) != 1 || claimedB[0].ID != claimedA[0].ID {
-				t.Fatalf("expected same owner to reclaim expired signal lease, got %+v", claimedB)
+				t.Fatalf("expected same owner to reclaim expired signal with new shard epoch, got %+v", claimedB)
+			}
+			if claimedB[0].OwnerEpoch == claimedA[0].OwnerEpoch {
+				t.Fatalf("expected shard epoch to advance after lease expiry: first=%+v second=%+v", claimedA[0], claimedB[0])
 			}
 
 			_, err := provider.Commit(ctx, AtomicCommit{
-				CompleteSignal: &CompleteSignalCommand{ID: claimedB[0].ID, Owner: "worker", Attempt: claimedB[0].Attempts},
+				CompleteSignal: &CompleteSignalCommand{ID: claimedB[0].ID, Owner: "worker", OwnerEpoch: claimedB[0].OwnerEpoch, Attempt: claimedB[0].Attempts},
 			})
 			if err != nil {
 				t.Fatalf("complete signal with second claim: %v", err)
 			}
 
 			_, err = provider.Commit(ctx, AtomicCommit{
-				CompleteSignal: &CompleteSignalCommand{ID: claimedA[0].ID, Owner: "worker", Attempt: claimedA[0].Attempts},
+				CompleteSignal: &CompleteSignalCommand{ID: claimedA[0].ID, Owner: "worker", OwnerEpoch: claimedA[0].OwnerEpoch, Attempt: claimedA[0].Attempts},
 				Transition: &CommitTransition{
 					MachineID:       "m1",
 					ExpectedVersion: 0,
@@ -556,6 +566,91 @@ func TestStaleSignalOwnerCannotCommitAfterLeaseIsStolen(t *testing.T) {
 			snap := readMachine(t, ctx, provider, "m1")
 			if snap.State != stateIdle || snap.Version != 0 || snap.Terminal() {
 				t.Fatalf("stale signal owner should not advance machine: %+v", snap)
+			}
+		})
+	}
+}
+
+func TestShardLeaseFencesCompletionAfterExpiry(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{})
+			createMachine(t, ctx, rt, "m1", 20, stateIdle)
+
+			_, err := provider.Commit(ctx, AtomicCommit{
+				Transition: &CommitTransition{
+					MachineID:       "m1",
+					ExpectedVersion: 0,
+					Record: TransitionRecord{
+						SourceState: stateIdle,
+						DestState:   stateWorking,
+						Trigger:     triggerStart,
+						CreateEntry: true,
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("seed entry: %v", err)
+			}
+
+			claimed := claimEntries(t, ctx, provider, "worker-a", 20, 1, 20*time.Millisecond)
+			if len(claimed) != 1 {
+				t.Fatalf("expected entry claim, got %+v", claimed)
+			}
+			time.Sleep(40 * time.Millisecond)
+
+			_, err = provider.Commit(ctx, AtomicCommit{
+				CompleteEntry: &CompleteEntryCommand{
+					Key:        claimed[0].Key,
+					Owner:      claimed[0].Owner,
+					OwnerEpoch: claimed[0].OwnerEpoch,
+					Attempt:    claimed[0].Attempts,
+				},
+			})
+			if !errors.Is(err, ErrShardLeaseLost) {
+				t.Fatalf("expected expired shard lease to fence completion, got %v", err)
+			}
+
+			reclaimed := claimEntries(t, ctx, provider, "worker-b", 20, 1, time.Second)
+			if len(reclaimed) != 1 || reclaimed[0].OwnerEpoch == claimed[0].OwnerEpoch {
+				t.Fatalf("expected reclaim under newer shard epoch, got %+v", reclaimed)
+			}
+		})
+	}
+}
+
+func TestShardLeaseOwnershipBlocksOtherWorkersUntilExpiry(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{})
+			createMachine(t, ctx, rt, "m1", 25, stateIdle)
+			if err := rt.Signal(ctx, NewSignal("s1", "m1", triggerStart)); err != nil {
+				t.Fatalf("signal: %v", err)
+			}
+
+			leasesA := acquireShardLeases(t, ctx, provider, "worker-a", 25, 40*time.Millisecond)
+			leasesB, err := provider.AcquireShardLeases(ctx, "worker-b", []ShardID{25}, time.Second)
+			if err != nil {
+				t.Fatalf("acquire contended shard: %v", err)
+			}
+			if len(leasesB) != 0 {
+				t.Fatalf("worker-b should not acquire live worker-a shard lease, got %+v", leasesB)
+			}
+			if signals, err := provider.ClaimSignals(ctx, leasesA, 1); err != nil || len(signals) != 1 {
+				t.Fatalf("worker-a should claim signal under live lease, signals=%+v err=%v", signals, err)
+			}
+
+			time.Sleep(60 * time.Millisecond)
+			leasesB, err = provider.AcquireShardLeases(ctx, "worker-b", []ShardID{25}, time.Second)
+			if err != nil {
+				t.Fatalf("acquire expired shard: %v", err)
+			}
+			if len(leasesB) != 1 || leasesB[0].Epoch <= leasesA[0].Epoch {
+				t.Fatalf("worker-b should acquire newer epoch after expiry, first=%+v second=%+v", leasesA, leasesB)
 			}
 		})
 	}
@@ -625,7 +720,7 @@ func TestHandlerSignalConflictRollsBackEntryCompletion(t *testing.T) {
 			if snap.State != stateWorking || snap.Version != 1 || snap.Terminal() {
 				t.Fatalf("output conflict should not advance machine: %+v", snap)
 			}
-			reclaimed := claimEntries(t, ctx, provider, "worker-b", 23, 10, time.Second)
+			reclaimed := claimEntries(t, ctx, provider, "worker-a", 23, 10, time.Second)
 			if len(reclaimed) != 1 || reclaimed[0].Key != (EntryKey{MachineID: "m1", Version: 1}) ||
 				reclaimed[0].LastError == "" {
 				t.Fatalf("entry completion should roll back and become retryable, got %+v", reclaimed)
@@ -639,7 +734,7 @@ func TestHandlerSignalConflictRollsBackEntryCompletion(t *testing.T) {
 	}
 }
 
-func TestClaimEntriesHonorsLimitAndLeases(t *testing.T) {
+func TestClaimEntriesHonorsLimitAndShardLease(t *testing.T) {
 	for _, tc := range providerCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -662,9 +757,14 @@ func TestClaimEntriesHonorsLimitAndLeases(t *testing.T) {
 				t.Fatalf("expected first claim limit of 2, got %d", len(first))
 			}
 
-			second := claimEntries(t, ctx, provider, "worker-b", 9, 10, time.Minute)
+			otherOwner := claimEntries(t, ctx, provider, "worker-b", 9, 10, time.Minute)
+			if len(otherOwner) != 0 {
+				t.Fatalf("different owner should not claim while shard lease is held, got %d", len(otherOwner))
+			}
+
+			second := claimEntries(t, ctx, provider, "worker-a", 9, 10, time.Minute)
 			if len(second) != 1 {
-				t.Fatalf("expected only unleased entry, got %d", len(second))
+				t.Fatalf("same shard owner should claim remaining pending entry, got %d", len(second))
 			}
 		})
 	}
@@ -698,7 +798,7 @@ func TestClaimEntriesIgnoresStaleVersions(t *testing.T) {
 				t.Fatalf("expected first entry claim, got %+v", claimed)
 			}
 			_, err = provider.Commit(ctx, AtomicCommit{
-				CompleteEntry: &CompleteEntryCommand{Key: claimed[0].Key, Owner: "worker", Attempt: claimed[0].Attempts},
+				CompleteEntry: &CompleteEntryCommand{Key: claimed[0].Key, Owner: "worker", OwnerEpoch: claimed[0].OwnerEpoch, Attempt: claimed[0].Attempts},
 			})
 			if err != nil {
 				t.Fatalf("complete first entry: %v", err)
@@ -815,7 +915,7 @@ func TestWorkContinuesAfterEntryFailure(t *testing.T) {
 				t.Fatalf("expected one successful entry despite failure, got %d", processed)
 			}
 
-			reclaimed := claimEntries(t, ctx, provider, "worker-2", 12, 10, time.Second)
+			reclaimed := claimEntries(t, ctx, provider, "worker", 12, 10, time.Second)
 			if len(reclaimed) != 1 || reclaimed[0].Key.MachineID != "m1" {
 				t.Fatalf("expected only failed entry to remain claimable, got %+v", reclaimed)
 			}
@@ -964,7 +1064,7 @@ func TestProcessEntryFailsEntryWhenHandlerFails(t *testing.T) {
 				t.Fatalf("expected handler error, got %v", err)
 			}
 
-			reclaimed := claimEntries(t, ctx, provider, "worker-2", 6, 10, time.Second)
+			reclaimed := claimEntries(t, ctx, provider, "worker", 6, 10, time.Second)
 			if len(reclaimed) != 1 || reclaimed[0].LastError != handlerErr.Error() {
 				t.Fatalf("expected failed entry with error, got %+v", reclaimed)
 			}
@@ -992,11 +1092,11 @@ func TestRetryBackoffDelaysFailedEntryAndSignal(t *testing.T) {
 			if !errors.Is(err, handlerErr) {
 				t.Fatalf("expected handler error, got %v", err)
 			}
-			if entries := claimEntries(t, ctx, provider, "inspector", 30, 10, time.Second); len(entries) != 0 {
+			if entries := claimEntries(t, ctx, provider, "entry-worker", 30, 10, time.Second); len(entries) != 0 {
 				t.Fatalf("failed entry should wait for retry_at, got %+v", entries)
 			}
 			time.Sleep(45 * time.Millisecond)
-			entries := claimEntries(t, ctx, provider, "inspector", 30, 10, time.Second)
+			entries := claimEntries(t, ctx, provider, "entry-worker", 30, 10, time.Second)
 			if len(entries) != 1 || entries[0].Attempts != 2 || entries[0].LastError != handlerErr.Error() {
 				t.Fatalf("expected entry after backoff with second attempt, got %+v", entries)
 			}
@@ -1009,11 +1109,11 @@ func TestRetryBackoffDelaysFailedEntryAndSignal(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected invalid signal error")
 			}
-			if signals := claimSignals(t, ctx, provider, "inspector", 31, 10, time.Second); len(signals) != 0 {
+			if signals := claimSignals(t, ctx, provider, "signal-worker", 31, 10, time.Second); len(signals) != 0 {
 				t.Fatalf("failed signal should wait for retry_at, got %+v", signals)
 			}
 			time.Sleep(45 * time.Millisecond)
-			signals := claimSignals(t, ctx, provider, "inspector", 31, 10, time.Second)
+			signals := claimSignals(t, ctx, provider, "signal-worker", 31, 10, time.Second)
 			if len(signals) != 1 || signals[0].Attempts != 2 || signals[0].LastError == "" {
 				t.Fatalf("expected signal after backoff with second attempt, got %+v", signals)
 			}
@@ -1075,7 +1175,7 @@ func TestRetryPolicyDeadLettersAfterMaxAttempts(t *testing.T) {
 	}
 }
 
-func TestRenewingEntryLeasePreventsStealDuringLongHandler(t *testing.T) {
+func TestRenewingShardLeasePreventsStealDuringLongHandler(t *testing.T) {
 	for _, tc := range providerCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1153,7 +1253,7 @@ func TestRenewingEntryLeasePreventsStealDuringLongHandler(t *testing.T) {
 	}
 }
 
-func TestRenewSignalLeasePreventsExpiredClaim(t *testing.T) {
+func TestRenewShardLeasePreventsExpiredSignalClaim(t *testing.T) {
 	for _, tc := range providerCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -1168,12 +1268,17 @@ func TestRenewSignalLeasePreventsExpiredClaim(t *testing.T) {
 			if len(claimed) != 1 {
 				t.Fatalf("expected signal claim, got %+v", claimed)
 			}
-			if err := provider.RenewSignalLease(ctx, claimed[0].ID, claimed[0].Owner, claimed[0].Attempts, 100*time.Millisecond); err != nil {
-				t.Fatalf("renew signal lease: %v", err)
+			leases := []ShardLease{{
+				ShardID: claimed[0].TargetShardID,
+				Owner:   claimed[0].Owner,
+				Epoch:   claimed[0].OwnerEpoch,
+			}}
+			if _, err := provider.RenewShardLeases(ctx, claimed[0].Owner, leases, 100*time.Millisecond); err != nil {
+				t.Fatalf("renew shard lease: %v", err)
 			}
 			time.Sleep(40 * time.Millisecond)
 			if signals := claimSignals(t, ctx, provider, "worker-b", 35, 1, time.Second); len(signals) != 0 {
-				t.Fatalf("renewed signal lease should not be claimable, got %+v", signals)
+				t.Fatalf("signal under renewed shard lease should not be claimable, got %+v", signals)
 			}
 		})
 	}
@@ -1204,7 +1309,8 @@ func processSignal(t *testing.T, ctx context.Context, rt *Runtime, provider Prov
 
 func processClaimedSignal(t *testing.T, ctx context.Context, rt *Runtime, provider Provider, owner string, shard ShardID) {
 	t.Helper()
-	signals := claimSignals(t, ctx, provider, owner, shard, 1, time.Second)
+	setupLease := 30 * time.Millisecond
+	signals := claimSignals(t, ctx, provider, owner, shard, 1, setupLease)
 	if len(signals) != 1 {
 		t.Fatalf("expected one signal, got %+v", signals)
 	}
@@ -1212,11 +1318,13 @@ func processClaimedSignal(t *testing.T, ctx context.Context, rt *Runtime, provid
 	if err := worker.processSignal(ctx, signals[0]); err != nil {
 		t.Fatalf("process signal: %v", err)
 	}
+	time.Sleep(setupLease + 10*time.Millisecond)
 }
 
 func claimSignals(t *testing.T, ctx context.Context, provider Provider, owner string, shard ShardID, limit int, lease time.Duration) []SignalRecord {
 	t.Helper()
-	signals, err := provider.ClaimSignals(ctx, owner, []ShardID{shard}, limit, lease)
+	leases := acquireShardLeases(t, ctx, provider, owner, shard, lease)
+	signals, err := provider.ClaimSignals(ctx, leases, limit)
 	if err != nil {
 		t.Fatalf("claim signals: %v", err)
 	}
@@ -1225,11 +1333,24 @@ func claimSignals(t *testing.T, ctx context.Context, provider Provider, owner st
 
 func claimEntries(t *testing.T, ctx context.Context, provider Provider, owner string, shard ShardID, limit int, lease time.Duration) []Entry {
 	t.Helper()
-	entries, err := provider.ClaimEntries(ctx, owner, []ShardID{shard}, limit, lease)
+	leases := acquireShardLeases(t, ctx, provider, owner, shard, lease)
+	entries, err := provider.ClaimEntries(ctx, leases, limit)
 	if err != nil {
 		t.Fatalf("claim entries: %v", err)
 	}
 	return entries
+}
+
+func acquireShardLeases(t *testing.T, ctx context.Context, provider Provider, owner string, shard ShardID, lease time.Duration) []ShardLease {
+	t.Helper()
+	if lease <= 0 {
+		lease = time.Second
+	}
+	leases, err := provider.AcquireShardLeases(ctx, owner, []ShardID{shard}, lease)
+	if err != nil {
+		t.Fatalf("acquire shard lease: %v", err)
+	}
+	return leases
 }
 
 func readMachine(t *testing.T, ctx context.Context, provider Provider, id string) *Snapshot {

@@ -12,18 +12,20 @@ import (
 // MemoryProvider is an in-memory Provider implementation intended for tests and
 // local demos. It is not durable across process restarts.
 type MemoryProvider struct {
-	mu       sync.Mutex
-	machines map[string]*Snapshot
-	entries  map[EntryKey]*Entry
-	signals  map[string]*SignalRecord
+	mu          sync.Mutex
+	machines    map[string]*Snapshot
+	entries     map[EntryKey]*Entry
+	signals     map[string]*SignalRecord
+	shardLeases map[ShardID]*ShardLease
 }
 
 // NewMemoryProvider creates an empty in-memory Provider.
 func NewMemoryProvider() *MemoryProvider {
 	return &MemoryProvider{
-		machines: make(map[string]*Snapshot),
-		entries:  make(map[EntryKey]*Entry),
-		signals:  make(map[string]*SignalRecord),
+		machines:    make(map[string]*Snapshot),
+		entries:     make(map[EntryKey]*Entry),
+		signals:     make(map[string]*SignalRecord),
+		shardLeases: make(map[ShardID]*ShardLease),
 	}
 }
 
@@ -87,11 +89,11 @@ func (p *MemoryProvider) EnqueueSignal(_ context.Context, signal SignalRecord) e
 	return enqueueSignal(p.signals, signal)
 }
 
-func (p *MemoryProvider) ClaimSignals(_ context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]SignalRecord, error) {
+func (p *MemoryProvider) AcquireShardLeases(_ context.Context, owner string, shards []ShardID, lease time.Duration) ([]ShardLease, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("durablestateless: owner is required")
 	}
-	if limit <= 0 || len(shards) == 0 {
+	if len(shards) == 0 {
 		return nil, nil
 	}
 	if err := validateShardIDs(shards); err != nil {
@@ -101,18 +103,85 @@ func (p *MemoryProvider) ClaimSignals(_ context.Context, owner string, shards []
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	shardSet := make(map[ShardID]struct{}, len(shards))
-	for _, shard := range shards {
-		shardSet[shard] = struct{}{}
-	}
-
 	now := nowUTC()
-	ids := make([]string, 0, len(p.signals))
-	for id, signal := range p.signals {
-		if _, ok := shardSet[signal.TargetShardID]; !ok {
+	leaseUntil := now.Add(lease)
+	leases := make([]ShardLease, 0, len(shards))
+	for _, shard := range shards {
+		current := p.shardLeases[shard]
+		if current != nil && current.LeaseUntil.After(now) && current.Owner != owner {
 			continue
 		}
-		if claimable(signal.Status, signal.LeaseUntil, signal.RetryAt, now) {
+		epoch := int64(1)
+		if current != nil {
+			epoch = current.Epoch
+			if current.Owner != owner || !current.LeaseUntil.After(now) {
+				epoch++
+			}
+		}
+		next := &ShardLease{
+			ShardID:    shard,
+			Owner:      owner,
+			Epoch:      epoch,
+			LeaseUntil: leaseUntil,
+			UpdatedAt:  now,
+		}
+		p.shardLeases[shard] = next
+		leases = append(leases, *next)
+	}
+	return leases, nil
+}
+
+func (p *MemoryProvider) RenewShardLeases(_ context.Context, owner string, leases []ShardLease, lease time.Duration) ([]ShardLease, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("durablestateless: owner is required")
+	}
+	if len(leases) == 0 {
+		return nil, nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := nowUTC()
+	for _, leaseToken := range leases {
+		current := p.shardLeases[leaseToken.ShardID]
+		if current == nil || current.Owner != owner || current.Epoch != leaseToken.Epoch || !current.LeaseUntil.After(now) {
+			return nil, ErrShardLeaseLost
+		}
+	}
+
+	leaseUntil := now.Add(lease)
+	renewed := make([]ShardLease, 0, len(leases))
+	for _, leaseToken := range leases {
+		current := p.shardLeases[leaseToken.ShardID]
+		current.LeaseUntil = leaseUntil
+		current.UpdatedAt = now
+		renewed = append(renewed, *current)
+	}
+	return renewed, nil
+}
+
+func (p *MemoryProvider) ClaimSignals(_ context.Context, leases []ShardLease, limit int) ([]SignalRecord, error) {
+	if limit <= 0 || len(leases) == 0 {
+		return nil, nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := nowUTC()
+	leaseSet := p.currentLeaseSet(leases, now)
+	if len(leaseSet) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]string, 0, len(p.signals))
+	for id, signal := range p.signals {
+		leaseToken, ok := leaseSet[signal.TargetShardID]
+		if !ok {
+			continue
+		}
+		if claimableByShardLease(signal.Status, signal.Owner, signal.OwnerEpoch, signal.RetryAt, leaseToken, now) {
 			ids = append(ids, id)
 		}
 	}
@@ -129,12 +198,13 @@ func (p *MemoryProvider) ClaimSignals(_ context.Context, owner string, shards []
 	}
 
 	claimed := make([]SignalRecord, 0, len(ids))
-	leaseUntil := now.Add(lease)
 	for _, id := range ids {
 		signal := p.signals[id]
+		leaseToken := leaseSet[signal.TargetShardID]
 		signal.Status = EntryProcessing
-		signal.Owner = owner
-		signal.LeaseUntil = &leaseUntil
+		signal.Owner = leaseToken.Owner
+		signal.OwnerEpoch = leaseToken.Epoch
+		signal.LeaseUntil = nil
 		signal.RetryAt = nil
 		signal.Attempts++
 		signal.StartedAt = &now
@@ -143,26 +213,20 @@ func (p *MemoryProvider) ClaimSignals(_ context.Context, owner string, shards []
 	return claimed, nil
 }
 
-func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]Entry, error) {
-	if owner == "" {
-		return nil, fmt.Errorf("durablestateless: owner is required")
-	}
-	if limit <= 0 || len(shards) == 0 {
+func (p *MemoryProvider) ClaimEntries(_ context.Context, leases []ShardLease, limit int) ([]Entry, error) {
+	if limit <= 0 || len(leases) == 0 {
 		return nil, nil
-	}
-	if err := validateShardIDs(shards); err != nil {
-		return nil, err
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	shardSet := make(map[ShardID]struct{}, len(shards))
-	for _, shard := range shards {
-		shardSet[shard] = struct{}{}
+	now := nowUTC()
+	leaseSet := p.currentLeaseSet(leases, now)
+	if len(leaseSet) == 0 {
+		return nil, nil
 	}
 
-	now := nowUTC()
 	keys := make([]EntryKey, 0, len(p.entries))
 	for key, entry := range p.entries {
 		machine := p.machines[key.MachineID]
@@ -172,10 +236,11 @@ func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []
 		if key.Version != machine.Version {
 			continue
 		}
-		if _, ok := shardSet[machine.ShardID]; !ok {
+		leaseToken, ok := leaseSet[machine.ShardID]
+		if !ok {
 			continue
 		}
-		if claimable(entry.Status, entry.LeaseUntil, entry.RetryAt, now) {
+		if claimableByShardLease(entry.Status, entry.Owner, entry.OwnerEpoch, entry.RetryAt, leaseToken, now) {
 			keys = append(keys, key)
 		}
 	}
@@ -195,12 +260,13 @@ func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []
 	}
 
 	claimed := make([]Entry, 0, len(keys))
-	leaseUntil := now.Add(lease)
 	for _, key := range keys {
 		entry := p.entries[key]
+		leaseToken := leaseSet[entry.ShardID]
 		entry.Status = EntryProcessing
-		entry.Owner = owner
-		entry.LeaseUntil = &leaseUntil
+		entry.Owner = leaseToken.Owner
+		entry.OwnerEpoch = leaseToken.Epoch
+		entry.LeaseUntil = nil
 		entry.RetryAt = nil
 		entry.Attempts++
 		entry.StartedAt = &now
@@ -216,14 +282,15 @@ func (p *MemoryProvider) Commit(_ context.Context, cmd AtomicCommit) (*CommitRes
 	machines := cloneSnapshots(p.machines)
 	entries := cloneEntries(p.entries)
 	signals := cloneSignalRecords(p.signals)
+	shardLeases := cloneShardLeases(p.shardLeases)
 
 	if cmd.CompleteSignal != nil {
-		if err := completeSignal(signals, cmd.CompleteSignal.ID, cmd.CompleteSignal.Owner, cmd.CompleteSignal.Attempt); err != nil {
+		if err := completeSignal(signals, shardLeases, cmd.CompleteSignal.ID, cmd.CompleteSignal.Owner, cmd.CompleteSignal.OwnerEpoch, cmd.CompleteSignal.Attempt); err != nil {
 			return nil, err
 		}
 	}
 	if cmd.CompleteEntry != nil {
-		if err := completeEntry(entries, cmd.CompleteEntry.Key, cmd.CompleteEntry.Owner, cmd.CompleteEntry.Attempt); err != nil {
+		if err := completeEntry(entries, machines, shardLeases, cmd.CompleteEntry.Key, cmd.CompleteEntry.Owner, cmd.CompleteEntry.OwnerEpoch, cmd.CompleteEntry.Attempt); err != nil {
 			return nil, err
 		}
 	}
@@ -247,6 +314,7 @@ func (p *MemoryProvider) Commit(_ context.Context, cmd AtomicCommit) (*CommitRes
 	p.machines = machines
 	p.entries = entries
 	p.signals = signals
+	p.shardLeases = shardLeases
 	return &CommitResult{
 		Snapshot: cloneSnapshot(snap),
 		Entry:    cloneEntry(entry),
@@ -254,28 +322,28 @@ func (p *MemoryProvider) Commit(_ context.Context, cmd AtomicCommit) (*CommitRes
 	}, nil
 }
 
-func (p *MemoryProvider) RenewSignalLease(_ context.Context, id string, owner string, attempt int, lease time.Duration) error {
+func (p *MemoryProvider) FailEntry(_ context.Context, key EntryKey, owner string, ownerEpoch int64, attempt int, failure Failure) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return renewSignalLease(p.signals, id, owner, attempt, lease)
+	return failEntry(p.entries, p.machines, p.shardLeases, key, owner, ownerEpoch, attempt, failure)
 }
 
-func (p *MemoryProvider) RenewEntryLease(_ context.Context, key EntryKey, owner string, attempt int, lease time.Duration) error {
+func (p *MemoryProvider) FailSignal(_ context.Context, id string, owner string, ownerEpoch int64, attempt int, failure Failure) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return renewEntryLease(p.entries, key, owner, attempt, lease)
+	return failSignal(p.signals, p.shardLeases, id, owner, ownerEpoch, attempt, failure)
 }
 
-func (p *MemoryProvider) FailEntry(_ context.Context, key EntryKey, owner string, attempt int, failure Failure) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return failEntry(p.entries, key, owner, attempt, failure)
-}
-
-func (p *MemoryProvider) FailSignal(_ context.Context, id string, owner string, attempt int, failure Failure) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return failSignal(p.signals, id, owner, attempt, failure)
+func (p *MemoryProvider) currentLeaseSet(leases []ShardLease, now time.Time) map[ShardID]ShardLease {
+	leaseSet := make(map[ShardID]ShardLease, len(leases))
+	for _, leaseToken := range leases {
+		current := p.shardLeases[leaseToken.ShardID]
+		if current == nil || current.Owner != leaseToken.Owner || current.Epoch != leaseToken.Epoch || !current.LeaseUntil.After(now) {
+			continue
+		}
+		leaseSet[leaseToken.ShardID] = *current
+	}
+	return leaseSet
 }
 
 func commitTransition(machines map[string]*Snapshot, entries map[EntryKey]*Entry, cmd CommitTransition) (*Snapshot, *Entry, error) {
@@ -360,6 +428,7 @@ func enqueueSignal(signals map[string]*SignalRecord, signal SignalRecord) error 
 	next.Args = cloneArgs(signal.Args)
 	next.Status = EntryPending
 	next.Owner = ""
+	next.OwnerEpoch = 0
 	next.LeaseUntil = nil
 	next.RetryAt = nil
 	next.StartedAt = nil
@@ -408,26 +477,34 @@ func validateRecordSymbols(record TransitionRecord) (string, string, string, err
 	return source, dest, trigger, nil
 }
 
-func claimable(status EntryStatus, leaseUntil *time.Time, retryAt *time.Time, now time.Time) bool {
+func claimableByShardLease(status EntryStatus, owner string, ownerEpoch int64, retryAt *time.Time, lease ShardLease, now time.Time) bool {
 	switch status {
 	case EntryPending:
 		return true
 	case EntryFailed:
 		return retryAt == nil || !retryAt.After(now)
 	case EntryProcessing:
-		return leaseUntil == nil || leaseUntil.Before(now)
+		return owner != lease.Owner || ownerEpoch != lease.Epoch
 	default:
 		return false
 	}
 }
 
-func completeEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt int) error {
+func completeEntry(
+	entries map[EntryKey]*Entry,
+	machines map[string]*Snapshot,
+	shardLeases map[ShardID]*ShardLease,
+	key EntryKey,
+	owner string,
+	ownerEpoch int64,
+	attempt int,
+) error {
 	entry := entries[key]
 	if entry == nil {
 		return ErrEntryNotFound
 	}
 	if entry.Status == EntryDone {
-		if entry.Owner == owner && entry.Attempts == attempt {
+		if entry.Owner == owner && entry.OwnerEpoch == ownerEpoch && entry.Attempts == attempt {
 			return nil
 		}
 		return ErrEntryNotOwned
@@ -435,8 +512,15 @@ func completeEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, atte
 	if entry.Status == EntryDeadLettered {
 		return ErrWorkDeadLettered
 	}
-	if entry.Status != EntryProcessing || entry.Owner != owner || entry.Attempts != attempt {
+	if entry.Status != EntryProcessing || entry.Owner != owner || entry.OwnerEpoch != ownerEpoch || entry.Attempts != attempt {
 		return ErrEntryNotOwned
+	}
+	machine := machines[key.MachineID]
+	if machine == nil {
+		return ErrMachineNotFound
+	}
+	if !shardLeaseOwned(shardLeases, machine.ShardID, owner, ownerEpoch, nowUTC()) {
+		return ErrShardLeaseLost
 	}
 	now := nowUTC()
 	entry.Status = EntryDone
@@ -446,13 +530,13 @@ func completeEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, atte
 	return nil
 }
 
-func completeSignal(signals map[string]*SignalRecord, id string, owner string, attempt int) error {
+func completeSignal(signals map[string]*SignalRecord, shardLeases map[ShardID]*ShardLease, id string, owner string, ownerEpoch int64, attempt int) error {
 	signal := signals[id]
 	if signal == nil {
 		return ErrSignalNotFound
 	}
 	if signal.Status == EntryDone {
-		if signal.Owner == owner && signal.Attempts == attempt {
+		if signal.Owner == owner && signal.OwnerEpoch == ownerEpoch && signal.Attempts == attempt {
 			return nil
 		}
 		return ErrSignalNotOwned
@@ -460,8 +544,11 @@ func completeSignal(signals map[string]*SignalRecord, id string, owner string, a
 	if signal.Status == EntryDeadLettered {
 		return ErrWorkDeadLettered
 	}
-	if signal.Status != EntryProcessing || signal.Owner != owner || signal.Attempts != attempt {
+	if signal.Status != EntryProcessing || signal.Owner != owner || signal.OwnerEpoch != ownerEpoch || signal.Attempts != attempt {
 		return ErrSignalNotOwned
+	}
+	if !shardLeaseOwned(shardLeases, signal.TargetShardID, owner, ownerEpoch, nowUTC()) {
+		return ErrShardLeaseLost
 	}
 	now := nowUTC()
 	signal.Status = EntryDone
@@ -471,48 +558,32 @@ func completeSignal(signals map[string]*SignalRecord, id string, owner string, a
 	return nil
 }
 
-func renewEntryLease(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt int, lease time.Duration) error {
+func failEntry(
+	entries map[EntryKey]*Entry,
+	machines map[string]*Snapshot,
+	shardLeases map[ShardID]*ShardLease,
+	key EntryKey,
+	owner string,
+	ownerEpoch int64,
+	attempt int,
+	failure Failure,
+) error {
 	entry := entries[key]
 	if entry == nil {
 		return ErrEntryNotFound
 	}
-	if entry.Status != EntryProcessing || entry.Owner != owner || entry.Attempts != attempt {
+	if entry.Status != EntryProcessing || entry.Owner != owner || entry.OwnerEpoch != ownerEpoch || entry.Attempts != attempt {
 		if entry.Status == EntryDeadLettered {
 			return ErrWorkDeadLettered
 		}
 		return ErrEntryNotOwned
 	}
-	leaseUntil := nowUTC().Add(lease)
-	entry.LeaseUntil = &leaseUntil
-	return nil
-}
-
-func renewSignalLease(signals map[string]*SignalRecord, id string, owner string, attempt int, lease time.Duration) error {
-	signal := signals[id]
-	if signal == nil {
-		return ErrSignalNotFound
+	machine := machines[key.MachineID]
+	if machine == nil {
+		return ErrMachineNotFound
 	}
-	if signal.Status != EntryProcessing || signal.Owner != owner || signal.Attempts != attempt {
-		if signal.Status == EntryDeadLettered {
-			return ErrWorkDeadLettered
-		}
-		return ErrSignalNotOwned
-	}
-	leaseUntil := nowUTC().Add(lease)
-	signal.LeaseUntil = &leaseUntil
-	return nil
-}
-
-func failEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt int, failure Failure) error {
-	entry := entries[key]
-	if entry == nil {
-		return ErrEntryNotFound
-	}
-	if entry.Status != EntryProcessing || entry.Owner != owner || entry.Attempts != attempt {
-		if entry.Status == EntryDeadLettered {
-			return ErrWorkDeadLettered
-		}
-		return ErrEntryNotOwned
+	if !shardLeaseOwned(shardLeases, machine.ShardID, owner, ownerEpoch, nowUTC()) {
+		return ErrShardLeaseLost
 	}
 	if failure.DeadLetter {
 		entry.Status = EntryDeadLettered
@@ -522,6 +593,7 @@ func failEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt 
 		entry.RetryAt = cloneTime(failure.RetryAt)
 	}
 	entry.Owner = ""
+	entry.OwnerEpoch = 0
 	entry.LeaseUntil = nil
 	if failure.Cause != nil {
 		entry.LastError = failure.Cause.Error()
@@ -529,16 +601,19 @@ func failEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt 
 	return nil
 }
 
-func failSignal(signals map[string]*SignalRecord, id string, owner string, attempt int, failure Failure) error {
+func failSignal(signals map[string]*SignalRecord, shardLeases map[ShardID]*ShardLease, id string, owner string, ownerEpoch int64, attempt int, failure Failure) error {
 	signal := signals[id]
 	if signal == nil {
 		return ErrSignalNotFound
 	}
-	if signal.Status != EntryProcessing || signal.Owner != owner || signal.Attempts != attempt {
+	if signal.Status != EntryProcessing || signal.Owner != owner || signal.OwnerEpoch != ownerEpoch || signal.Attempts != attempt {
 		if signal.Status == EntryDeadLettered {
 			return ErrWorkDeadLettered
 		}
 		return ErrSignalNotOwned
+	}
+	if !shardLeaseOwned(shardLeases, signal.TargetShardID, owner, ownerEpoch, nowUTC()) {
+		return ErrShardLeaseLost
 	}
 	if failure.DeadLetter {
 		signal.Status = EntryDeadLettered
@@ -548,11 +623,20 @@ func failSignal(signals map[string]*SignalRecord, id string, owner string, attem
 		signal.RetryAt = cloneTime(failure.RetryAt)
 	}
 	signal.Owner = ""
+	signal.OwnerEpoch = 0
 	signal.LeaseUntil = nil
 	if failure.Cause != nil {
 		signal.LastError = failure.Cause.Error()
 	}
 	return nil
+}
+
+func shardLeaseOwned(shardLeases map[ShardID]*ShardLease, shard ShardID, owner string, ownerEpoch int64, now time.Time) bool {
+	lease := shardLeases[shard]
+	return lease != nil &&
+		lease.Owner == owner &&
+		lease.Epoch == ownerEpoch &&
+		lease.LeaseUntil.After(now)
 }
 
 func cloneSnapshots(in map[string]*Snapshot) map[string]*Snapshot {
@@ -575,6 +659,18 @@ func cloneSignalRecords(in map[string]*SignalRecord) map[string]*SignalRecord {
 	out := make(map[string]*SignalRecord, len(in))
 	for key, signal := range in {
 		out[key] = cloneSignalRecord(signal)
+	}
+	return out
+}
+
+func cloneShardLeases(in map[ShardID]*ShardLease) map[ShardID]*ShardLease {
+	out := make(map[ShardID]*ShardLease, len(in))
+	for key, lease := range in {
+		if lease == nil {
+			continue
+		}
+		next := *lease
+		out[key] = &next
 	}
 	return out
 }
@@ -607,6 +703,7 @@ func cloneEntry(entry *Entry) *Entry {
 		Args:        cloneArgs(entry.Args),
 		Status:      entry.Status,
 		Owner:       entry.Owner,
+		OwnerEpoch:  entry.OwnerEpoch,
 		LeaseUntil:  cloneTime(entry.LeaseUntil),
 		RetryAt:     cloneTime(entry.RetryAt),
 		Attempts:    entry.Attempts,
@@ -631,6 +728,7 @@ func cloneSignalRecord(signal *SignalRecord) *SignalRecord {
 		TargetShardID: signal.TargetShardID,
 		Status:        signal.Status,
 		Owner:         signal.Owner,
+		OwnerEpoch:    signal.OwnerEpoch,
 		LeaseUntil:    cloneTime(signal.LeaseUntil),
 		RetryAt:       cloneTime(signal.RetryAt),
 		Attempts:      signal.Attempts,

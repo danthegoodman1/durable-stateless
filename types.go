@@ -9,8 +9,9 @@ import (
 	"github.com/qmuntal/stateless"
 )
 
-// DefaultLeaseDuration is used by workers when no explicit lease duration is
-// configured. A lease should be longer than the normal handler runtime.
+// DefaultLeaseDuration is used by workers when no explicit shard lease
+// duration is configured. A worker must renew its shard lease before it expires
+// to keep completing claimed work.
 const DefaultLeaseDuration = 30 * time.Second
 
 var (
@@ -21,6 +22,7 @@ var (
 	ErrInvalidShard      = errors.New("durablestateless: invalid shard configuration")
 	ErrInvalidTransition = errors.New("durablestateless: invalid transition record")
 	ErrNilEntryHandler   = errors.New("durablestateless: entry handler is nil")
+	ErrShardLeaseLost    = errors.New("durablestateless: shard lease is not owned")
 	ErrSignalConflict    = errors.New("durablestateless: signal id conflicts with existing signal")
 	ErrSignalNotFound    = errors.New("durablestateless: signal not found")
 	ErrSignalNotOwned    = errors.New("durablestateless: signal is not processing for owner")
@@ -34,13 +36,23 @@ var (
 // signals and entry work for shards they currently own.
 type ShardID int
 
+// ShardLease is a worker's temporary ownership token for a shard. Epoch changes
+// every time ownership is reacquired after expiry, which fences stale workers.
+type ShardLease struct {
+	ShardID    ShardID
+	Owner      string
+	Epoch      int64
+	LeaseUntil time.Time
+	UpdatedAt  time.Time
+}
+
 // EntryStatus is the durable lifecycle state for entry work and signals.
 type EntryStatus string
 
 const (
 	// EntryPending means work has been committed and has not been claimed.
 	EntryPending EntryStatus = "pending"
-	// EntryProcessing means work is leased by a worker.
+	// EntryProcessing means work is claimed under a worker's shard lease.
 	EntryProcessing EntryStatus = "processing"
 	// EntryDone means work completed successfully.
 	EntryDone EntryStatus = "done"
@@ -138,6 +150,7 @@ type Entry struct {
 	Args        []any
 	Status      EntryStatus
 	Owner       string
+	OwnerEpoch  int64
 	LeaseUntil  *time.Time
 	RetryAt     *time.Time
 	Attempts    int
@@ -167,11 +180,12 @@ type CommitTransition struct {
 }
 
 // CompleteEntryCommand marks a claimed entry complete as part of an
-// AtomicCommit. Owner and Attempt together form the claim token.
+// AtomicCommit. Owner, OwnerEpoch, and Attempt together form the claim token.
 type CompleteEntryCommand struct {
-	Key     EntryKey
-	Owner   string
-	Attempt int
+	Key        EntryKey
+	Owner      string
+	OwnerEpoch int64
+	Attempt    int
 }
 
 // Signal is a durable trigger message for a target machine. ID is the
@@ -200,6 +214,7 @@ type SignalRecord struct {
 	TargetShardID ShardID
 	Status        EntryStatus
 	Owner         string
+	OwnerEpoch    int64
 	LeaseUntil    *time.Time
 	RetryAt       *time.Time
 	Attempts      int
@@ -210,11 +225,12 @@ type SignalRecord struct {
 }
 
 // CompleteSignalCommand marks a claimed signal complete as part of an
-// AtomicCommit. Owner and Attempt together form the claim token.
+// AtomicCommit. Owner, OwnerEpoch, and Attempt together form the claim token.
 type CompleteSignalCommand struct {
-	ID      string
-	Owner   string
-	Attempt int
+	ID         string
+	Owner      string
+	OwnerEpoch int64
+	Attempt    int
 }
 
 // AtomicCommit is the provider's durability boundary. Providers must apply all
@@ -244,21 +260,22 @@ type Provider interface {
 	ReadMachine(ctx context.Context, id string) (*Snapshot, error)
 	// EnqueueSignal durably inserts a signal, deduplicated by signal ID.
 	EnqueueSignal(ctx context.Context, signal SignalRecord) error
-	// ClaimSignals leases claimable signals for owned shards.
-	ClaimSignals(ctx context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]SignalRecord, error)
-	// ClaimEntries leases claimable entry work for owned shards.
-	ClaimEntries(ctx context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]Entry, error)
-	// RenewSignalLease extends a signal lease for the current claim token.
-	RenewSignalLease(ctx context.Context, id string, owner string, attempt int, lease time.Duration) error
-	// RenewEntryLease extends an entry lease for the current claim token.
-	RenewEntryLease(ctx context.Context, key EntryKey, owner string, attempt int, lease time.Duration) error
+	// AcquireShardLeases acquires or renews ownership of the requested shards.
+	AcquireShardLeases(ctx context.Context, owner string, shards []ShardID, lease time.Duration) ([]ShardLease, error)
+	// RenewShardLeases extends the current shard ownership tokens. If any token
+	// is stale or expired, providers should return ErrShardLeaseLost.
+	RenewShardLeases(ctx context.Context, owner string, leases []ShardLease, lease time.Duration) ([]ShardLease, error)
+	// ClaimSignals claims work for currently owned shard leases.
+	ClaimSignals(ctx context.Context, leases []ShardLease, limit int) ([]SignalRecord, error)
+	// ClaimEntries claims entry work for currently owned shard leases.
+	ClaimEntries(ctx context.Context, leases []ShardLease, limit int) ([]Entry, error)
 	// Commit applies all requested completion, transition, and signal changes
 	// atomically.
 	Commit(ctx context.Context, cmd AtomicCommit) (*CommitResult, error)
 	// FailEntry records a failed entry attempt using the supplied retry decision.
-	FailEntry(ctx context.Context, key EntryKey, owner string, attempt int, failure Failure) error
+	FailEntry(ctx context.Context, key EntryKey, owner string, ownerEpoch int64, attempt int, failure Failure) error
 	// FailSignal records a failed signal attempt using the supplied retry decision.
-	FailSignal(ctx context.Context, id string, owner string, attempt int, failure Failure) error
+	FailSignal(ctx context.Context, id string, owner string, ownerEpoch int64, attempt int, failure Failure) error
 }
 
 // Definition describes a durable state machine. Configure should define
