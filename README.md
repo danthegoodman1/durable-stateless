@@ -11,7 +11,7 @@ The important idea is simple:
 
 ```text
 stateless decides whether a transition is legal
-the provider atomically commits the new durable state
+the provider atomically commits durable state and outgoing signals
 entry handlers run after commit and are retried until marked done
 ```
 
@@ -24,18 +24,31 @@ Small taste:
 provider := durablestateless.NewMemoryProvider()
 _ = provider.Migrate(ctx)
 
-runner := durablestateless.NewRunner(provider, OrderMachine{})
+sharder := durablestateless.MustHashSharder(1024)
+rt := durablestateless.NewRuntime(
+	provider,
+	OrderMachine{},
+	durablestateless.WithSharder(sharder),
+)
 
-_ = runner.CreateMachine(ctx, durablestateless.MachineInit{
-	ID:      "order-123",
-	ShardID: 7,
-	State:   "new",
+_ = rt.CreateMachine(ctx, durablestateless.MachineInit{
+	ID:    "order-123",
+	State: "new",
 })
 
-_ = runner.Fire(ctx, "order-123", "start")
+_ = rt.Signal(ctx, durablestateless.NewSignal(
+	"request-abc123",
+	"order-123",
+	"start",
+	"customer-42",
+))
 
-// Usually called when a shard worker starts, then in a polling loop.
-processed, err := runner.Recover(ctx, "worker-a", []int{7}, 100)
+worker := rt.Worker(durablestateless.WorkerConfig{
+	ID:     "worker-a",
+	Shards: []durablestateless.ShardID{sharder.ShardForMachine("order-123")},
+})
+
+processed, err := worker.Work(ctx, 100)
 ```
 
 ## Mental Model
@@ -69,11 +82,13 @@ If a transition already committed and created an entry row, a worker should
 recover it as soon as it comes online:
 
 ```go
-processed, err := runner.Recover(ctx, "worker-a", []int{3, 7}, 100)
+processed, err := worker.Work(ctx, 100)
 ```
 
-That claims `pending`, `failed`, and expired `processing` entries for the
-worker's shards.
+That claims durable signals and entry work for the worker's shards.
+Workers recover unfinished entry work before applying queued signals, so a
+signal does not get stuck behind a lease for work the same worker could have
+completed first.
 
 What the runtime does **not** do is scan every non-terminal machine and ask
 whether its current state should be doing something. A non-terminal machine
@@ -83,14 +98,14 @@ Shard ownership is therefore a worker concern:
 
 ```text
 worker owns shards [3, 7]
-worker calls Recover(..., []int{3, 7}, ...)
-provider only leases entries whose machine rows belong to those shards
+worker calls Work(...)
+provider only leases signals and entries for those shards
 ```
 
-Shard assignment is explicit today: the caller sets `MachineInit.ShardID` when
-creating a machine. A provider persists that value and uses it for recovery
-claims; it should not invent a different placement policy behind the runtime's
-back.
+Shard assignment is a runtime concern. By default all machines live on shard
+zero; pass `WithSharder(MustHashSharder(n))` to place machines by
+`hash(machine_id) % n`. A provider persists the shard chosen by the runtime and
+uses it for recovery claims.
 
 Crash behavior:
 
@@ -99,8 +114,42 @@ before transition commit              -> no state change exists
 after commit, before handler starts   -> pending entry is recovered
 during handler                        -> lease expires; entry is retried
 after side effect, before done mark   -> same entry key is retried
-handler returns next trigger          -> done mark + next transition commit atomically
+handler returns next trigger/signals  -> done mark + outputs commit atomically
 ```
+
+## Next Vs Signals
+
+Entry handlers can return two kinds of durable outputs:
+
+```go
+return durablestateless.HandlerResult{
+	Next: durablestateless.Next("paid"),
+	Signals: []durablestateless.Signal{
+		durablestateless.NewSignal(entry.Key.String()+":notify", "notification-123", "send"),
+	},
+}, nil
+```
+
+`Next` means "continue this same machine now." When the handler succeeds, the
+runtime commits the entry's done mark and applies `Next` to the machine that
+created the entry in the same provider commit. Use `Next` when the handler's
+result decides the current machine's next state, such as `charging -> paid`.
+
+`Signals` means "enqueue durable messages for machines to process later." The
+runtime commits the entry's done mark and the signal rows in the same provider
+commit, but those signals are claimed and applied later by workers that own the
+target machines' shards. Use signals for cross-shard messages, fan-out, and
+decoupled follow-up work.
+
+Short version:
+
+```text
+Next    -> same machine, same commit, immediate transition
+Signals -> any machine, same commit to enqueue, later transition
+```
+
+Do not call `rt.Signal` directly from inside a handler when the signal must be
+atomic with handler completion. Return it in `HandlerResult.Signals` instead.
 
 ## Defining A Machine
 
@@ -141,14 +190,21 @@ func (OrderMachine) EntryHandler(state stateless.State) (durablestateless.EntryH
 		if err := chargeCustomer(ctx, entry.Key.String()); err != nil {
 			return durablestateless.NoNext(), err
 		}
-		return durablestateless.FireNext("paid"), nil
+		// Return outputs instead of calling rt.Signal here. The runtime commits
+		// the done mark and these outputs atomically.
+		return durablestateless.HandlerResult{
+			Next: durablestateless.Next("paid"),
+			Signals: []durablestateless.Signal{
+				durablestateless.NewSignal(entry.Key.String()+":notify", "notification-123", "send"),
+			},
+		}, nil
 	}, true
 }
 ```
 
 ## Running It
 
-Create a provider and runner:
+Create a provider and runtime:
 
 ```go
 provider, err := durablestateless.OpenSQLiteProvider("machines.db")
@@ -161,28 +217,37 @@ if err := provider.Migrate(ctx); err != nil {
 	return err
 }
 
-runner := durablestateless.NewRunner(provider, OrderMachine{})
+sharder := durablestateless.MustHashSharder(1024)
+rt := durablestateless.NewRuntime(
+	provider,
+	OrderMachine{},
+	durablestateless.WithSharder(sharder),
+)
 ```
 
-Create and fire a machine:
+Create a machine and send it a durable signal:
 
 ```go
-err = runner.CreateMachine(ctx, durablestateless.MachineInit{
-	ID:      "order-123",
-	ShardID: 7,
-	State:   "new",
+err = rt.CreateMachine(ctx, durablestateless.MachineInit{
+	ID:    "order-123",
+	State: "new",
 })
 
-err = runner.Fire(ctx, "order-123", "start")
+err = rt.Signal(ctx, durablestateless.NewSignal("request-abc123", "order-123", "start"))
 ```
 
-Run recovery for the shards this worker owns:
+Run work for the shards this worker owns:
 
 ```go
+worker := rt.Worker(durablestateless.WorkerConfig{
+	ID:     "worker-a",
+	Shards: []durablestateless.ShardID{sharder.ShardForMachine("order-123")},
+})
+
 for {
-	processed, err := runner.Recover(ctx, "worker-a", []int{7}, 100)
+	processed, err := worker.Work(ctx, 100)
 	if err != nil {
-		log.Printf("recover: %v", err)
+		log.Printf("work: %v", err)
 	}
 	if processed == 0 {
 		time.Sleep(time.Second)
@@ -194,7 +259,7 @@ There is also an in-memory provider for tests:
 
 ```go
 provider := durablestateless.NewMemoryProvider()
-runner := durablestateless.NewRunner(provider, OrderMachine{})
+rt := durablestateless.NewRuntime(provider, OrderMachine{})
 ```
 
 ## Provider Contract
@@ -202,14 +267,21 @@ runner := durablestateless.NewRunner(provider, OrderMachine{})
 Providers expose atomic commands, not interactive transactions:
 
 ```go
-CommitTransition(ctx, cmd)
-CompleteEntryAndCommitTransition(ctx, cmd)
+EnqueueSignal(ctx, signal)
+ClaimSignals(ctx, owner, shards, limit, lease)
+ClaimEntries(ctx, owner, shards, limit, lease)
+Commit(ctx, atomicCommit)
 ```
 
-Those commands must atomically update the current machine projection and entry
-work. SQLite uses a short internal transaction to do this, but that is an
-implementation detail. Other providers can use conditional writes, CAS, batch
-writes, or an append log plus projection.
+`Commit` atomically completes claimed work, advances the current machine
+projection, creates entry work, and appends outgoing signals. SQLite uses a
+short internal transaction to do this, but that is an implementation detail.
+Other providers can use conditional writes, CAS, batch writes, or an append log
+plus projection.
+
+Completion and failure use the claim's `(owner, attempt)` pair, not just owner,
+so a stale process cannot finish work after the same worker ID has reclaimed an
+expired lease.
 
 ## Current Scope
 
@@ -218,6 +290,4 @@ This is still a PoC.
 - states and triggers must be strings or string aliases
 - args must be JSON-compatible
 - SQLite uses `github.com/mattn/go-sqlite3`, so CGO is required
-- shard ownership is enforced by recovery claims, not by `Fire`
-- cross-shard messaging should be modeled as a durable signal/outbox layer
-  above this package
+- shard ownership is enforced by worker claims; public callers send signals

@@ -2,22 +2,28 @@ package durablestateless
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 )
 
+// MemoryProvider is an in-memory Provider implementation intended for tests and
+// local demos. It is not durable across process restarts.
 type MemoryProvider struct {
 	mu       sync.Mutex
 	machines map[string]*Snapshot
 	entries  map[EntryKey]*Entry
+	signals  map[string]*SignalRecord
 }
 
+// NewMemoryProvider creates an empty in-memory Provider.
 func NewMemoryProvider() *MemoryProvider {
 	return &MemoryProvider{
 		machines: make(map[string]*Snapshot),
 		entries:  make(map[EntryKey]*Entry),
+		signals:  make(map[string]*SignalRecord),
 	}
 }
 
@@ -25,36 +31,39 @@ func (p *MemoryProvider) Migrate(context.Context) error {
 	return nil
 }
 
-func (p *MemoryProvider) CreateMachine(_ context.Context, init MachineInit) error {
-	if init.ID == "" {
+func (p *MemoryProvider) CreateMachine(_ context.Context, record MachineRecord) error {
+	if record.ID == "" {
 		return fmt.Errorf("durablestateless: machine id is required")
 	}
-	state, err := encodeSymbol("state", init.State)
+	if err := validateShardID(record.ShardID); err != nil {
+		return err
+	}
+	state, err := encodeSymbol("state", record.State)
 	if err != nil {
 		return err
 	}
-	if _, err := encodeArgs(init.Args); err != nil {
+	if _, err := encodeArgs(record.Args); err != nil {
 		return err
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if _, exists := p.machines[init.ID]; exists {
-		return fmt.Errorf("durablestateless: machine %q already exists", init.ID)
+	if _, exists := p.machines[record.ID]; exists {
+		return fmt.Errorf("durablestateless: machine %q already exists", record.ID)
 	}
 
 	now := nowUTC()
 	var terminalAt *time.Time
-	if init.Terminal {
+	if record.Terminal {
 		terminalAt = &now
 	}
-	p.machines[init.ID] = &Snapshot{
-		ID:         init.ID,
-		ShardID:    init.ShardID,
+	p.machines[record.ID] = &Snapshot{
+		ID:         record.ID,
+		ShardID:    record.ShardID,
 		State:      state,
 		Version:    0,
-		Args:       cloneArgs(init.Args),
+		Args:       cloneArgs(record.Args),
 		TerminalAt: cloneTime(terminalAt),
 		UpdatedAt:  now,
 	}
@@ -72,29 +81,82 @@ func (p *MemoryProvider) ReadMachine(_ context.Context, id string) (*Snapshot, e
 	return cloneSnapshot(snap), nil
 }
 
-func (p *MemoryProvider) CommitTransition(_ context.Context, cmd CommitTransition) (*Snapshot, *Entry, error) {
+func (p *MemoryProvider) EnqueueSignal(_ context.Context, signal SignalRecord) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	snap, entry, err := p.commitTransitionLocked(cmd)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cloneSnapshot(snap), cloneEntry(entry), nil
+	return enqueueSignal(p.signals, signal)
 }
 
-func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []int, limit int, lease time.Duration) ([]Entry, error) {
+func (p *MemoryProvider) ClaimSignals(_ context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]SignalRecord, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("durablestateless: owner is required")
 	}
 	if limit <= 0 || len(shards) == 0 {
 		return nil, nil
 	}
+	if err := validateShardIDs(shards); err != nil {
+		return nil, err
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	shardSet := make(map[int]struct{}, len(shards))
+	shardSet := make(map[ShardID]struct{}, len(shards))
+	for _, shard := range shards {
+		shardSet[shard] = struct{}{}
+	}
+
+	now := nowUTC()
+	ids := make([]string, 0, len(p.signals))
+	for id, signal := range p.signals {
+		if _, ok := shardSet[signal.TargetShardID]; !ok {
+			continue
+		}
+		if claimable(signal.Status, signal.LeaseUntil, now) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		left := p.signals[ids[i]]
+		right := p.signals[ids[j]]
+		if left.CreatedAt.Equal(right.CreatedAt) {
+			return left.ID < right.ID
+		}
+		return left.CreatedAt.Before(right.CreatedAt)
+	})
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+
+	claimed := make([]SignalRecord, 0, len(ids))
+	leaseUntil := now.Add(lease)
+	for _, id := range ids {
+		signal := p.signals[id]
+		signal.Status = EntryProcessing
+		signal.Owner = owner
+		signal.LeaseUntil = &leaseUntil
+		signal.Attempts++
+		signal.StartedAt = &now
+		claimed = append(claimed, *cloneSignalRecord(signal))
+	}
+	return claimed, nil
+}
+
+func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]Entry, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("durablestateless: owner is required")
+	}
+	if limit <= 0 || len(shards) == 0 {
+		return nil, nil
+	}
+	if err := validateShardIDs(shards); err != nil {
+		return nil, err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	shardSet := make(map[ShardID]struct{}, len(shards))
 	for _, shard := range shards {
 		shardSet[shard] = struct{}{}
 	}
@@ -112,12 +174,20 @@ func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []
 		if _, ok := shardSet[machine.ShardID]; !ok {
 			continue
 		}
-		if claimable(entry, now) {
+		if claimable(entry.Status, entry.LeaseUntil, now) {
 			keys = append(keys, key)
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool {
-		return p.entries[keys[i]].CreatedAt.Before(p.entries[keys[j]].CreatedAt)
+		left := p.entries[keys[i]]
+		right := p.entries[keys[j]]
+		if left.CreatedAt.Equal(right.CreatedAt) {
+			if left.Key.MachineID == right.Key.MachineID {
+				return left.Key.Version < right.Key.Version
+			}
+			return left.Key.MachineID < right.Key.MachineID
+		}
+		return left.CreatedAt.Before(right.CreatedAt)
 	})
 	if len(keys) > limit {
 		keys = keys[:limit]
@@ -137,46 +207,61 @@ func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []
 	return claimed, nil
 }
 
-func (p *MemoryProvider) CompleteEntry(_ context.Context, key EntryKey, owner string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return completeEntry(p.entries, key, owner)
-}
-
-func (p *MemoryProvider) CompleteEntryAndCommitTransition(_ context.Context, cmd CompleteEntryAndCommitTransition) (*Snapshot, *Entry, error) {
+func (p *MemoryProvider) Commit(_ context.Context, cmd AtomicCommit) (*CommitResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	machines := cloneSnapshots(p.machines)
 	entries := cloneEntries(p.entries)
-	if err := completeEntry(entries, cmd.Complete.Key, cmd.Complete.Owner); err != nil {
-		return nil, nil, err
+	signals := cloneSignalRecords(p.signals)
+
+	if cmd.CompleteSignal != nil {
+		if err := completeSignal(signals, cmd.CompleteSignal.ID, cmd.CompleteSignal.Owner, cmd.CompleteSignal.Attempt); err != nil {
+			return nil, err
+		}
 	}
-	snap, entry, err := commitTransition(machines, entries, cmd.Transition)
-	if err != nil {
-		return nil, nil, err
+	if cmd.CompleteEntry != nil {
+		if err := completeEntry(entries, cmd.CompleteEntry.Key, cmd.CompleteEntry.Owner, cmd.CompleteEntry.Attempt); err != nil {
+			return nil, err
+		}
 	}
+
+	var snap *Snapshot
+	var entry *Entry
+	var err error
+	if cmd.Transition != nil {
+		snap, entry, err = commitTransition(machines, entries, *cmd.Transition)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, signal := range cmd.Signals {
+		if err := enqueueSignal(signals, signal); err != nil {
+			return nil, err
+		}
+	}
+
 	p.machines = machines
 	p.entries = entries
-	return cloneSnapshot(snap), cloneEntry(entry), nil
+	p.signals = signals
+	return &CommitResult{
+		Snapshot: cloneSnapshot(snap),
+		Entry:    cloneEntry(entry),
+		Signals:  cloneSignalRecordValues(cmd.Signals),
+	}, nil
 }
 
-func (p *MemoryProvider) FailEntry(_ context.Context, key EntryKey, owner string, cause error) error {
+func (p *MemoryProvider) FailEntry(_ context.Context, key EntryKey, owner string, attempt int, cause error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return failEntry(p.entries, key, owner, cause)
+	return failEntry(p.entries, key, owner, attempt, cause)
 }
 
-func (p *MemoryProvider) commitTransitionLocked(cmd CommitTransition) (*Snapshot, *Entry, error) {
-	machines := cloneSnapshots(p.machines)
-	entries := cloneEntries(p.entries)
-	snap, entry, err := commitTransition(machines, entries, cmd)
-	if err != nil {
-		return nil, nil, err
-	}
-	p.machines = machines
-	p.entries = entries
-	return snap, entry, nil
+func (p *MemoryProvider) FailSignal(_ context.Context, id string, owner string, attempt int, cause error) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return failSignal(p.signals, id, owner, attempt, cause)
 }
 
 func commitTransition(machines map[string]*Snapshot, entries map[EntryKey]*Entry, cmd CommitTransition) (*Snapshot, *Entry, error) {
@@ -192,6 +277,9 @@ func commitTransition(machines map[string]*Snapshot, entries map[EntryKey]*Entry
 	}
 	if err := assertNoOpenEntry(entries, cmd.MachineID, cmd.ExpectedVersion); err != nil {
 		return nil, nil, err
+	}
+	if cmd.Record.Terminal && cmd.Record.CreateEntry {
+		return nil, nil, fmt.Errorf("%w: terminal transitions cannot create entry work", ErrInvalidTransition)
 	}
 
 	source, dest, trigger, err := validateRecordSymbols(cmd.Record)
@@ -234,6 +322,53 @@ func commitTransition(machines map[string]*Snapshot, entries map[EntryKey]*Entry
 	return snap, entry, nil
 }
 
+func enqueueSignal(signals map[string]*SignalRecord, signal SignalRecord) error {
+	if signal.ID == "" {
+		return fmt.Errorf("durablestateless: signal id is required")
+	}
+	if signal.MachineID == "" {
+		return fmt.Errorf("durablestateless: signal machine id is required")
+	}
+	if err := validateShardID(signal.TargetShardID); err != nil {
+		return err
+	}
+	trigger, err := encodeSymbol("trigger", signal.Trigger)
+	if err != nil {
+		return err
+	}
+	argsJSON, err := encodeArgs(signal.Args)
+	if err != nil {
+		return err
+	}
+	now := nowUTC()
+	next := signal
+	next.Trigger = trigger
+	next.Args = cloneArgs(signal.Args)
+	next.Status = EntryPending
+	next.Owner = ""
+	next.LeaseUntil = nil
+	next.StartedAt = nil
+	next.CompletedAt = nil
+	next.LastError = ""
+	if next.CreatedAt.IsZero() {
+		next.CreatedAt = now
+	}
+
+	existing := signals[next.ID]
+	if existing != nil {
+		existingArgs, _ := json.Marshal(existing.Args)
+		if existing.MachineID == next.MachineID &&
+			existing.TargetShardID == next.TargetShardID &&
+			existing.Trigger == next.Trigger &&
+			string(existingArgs) == argsJSON {
+			return nil
+		}
+		return ErrSignalConflict
+	}
+	signals[next.ID] = cloneSignalRecord(&next)
+	return nil
+}
+
 func assertNoOpenEntry(entries map[EntryKey]*Entry, machineID string, version int64) error {
 	entry := entries[EntryKey{MachineID: machineID, Version: version}]
 	if entry == nil || entry.Status == EntryDone {
@@ -258,26 +393,29 @@ func validateRecordSymbols(record TransitionRecord) (string, string, string, err
 	return source, dest, trigger, nil
 }
 
-func claimable(entry *Entry, now time.Time) bool {
-	switch entry.Status {
+func claimable(status EntryStatus, leaseUntil *time.Time, now time.Time) bool {
+	switch status {
 	case EntryPending, EntryFailed:
 		return true
 	case EntryProcessing:
-		return entry.LeaseUntil == nil || entry.LeaseUntil.Before(now)
+		return leaseUntil == nil || leaseUntil.Before(now)
 	default:
 		return false
 	}
 }
 
-func completeEntry(entries map[EntryKey]*Entry, key EntryKey, owner string) error {
+func completeEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt int) error {
 	entry := entries[key]
 	if entry == nil {
 		return ErrEntryNotFound
 	}
 	if entry.Status == EntryDone {
-		return nil
+		if entry.Owner == owner && entry.Attempts == attempt {
+			return nil
+		}
+		return ErrEntryNotOwned
 	}
-	if entry.Status != EntryProcessing || entry.Owner != owner {
+	if entry.Status != EntryProcessing || entry.Owner != owner || entry.Attempts != attempt {
 		return ErrEntryNotOwned
 	}
 	now := nowUTC()
@@ -287,12 +425,33 @@ func completeEntry(entries map[EntryKey]*Entry, key EntryKey, owner string) erro
 	return nil
 }
 
-func failEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, cause error) error {
+func completeSignal(signals map[string]*SignalRecord, id string, owner string, attempt int) error {
+	signal := signals[id]
+	if signal == nil {
+		return ErrSignalNotFound
+	}
+	if signal.Status == EntryDone {
+		if signal.Owner == owner && signal.Attempts == attempt {
+			return nil
+		}
+		return ErrSignalNotOwned
+	}
+	if signal.Status != EntryProcessing || signal.Owner != owner || signal.Attempts != attempt {
+		return ErrSignalNotOwned
+	}
+	now := nowUTC()
+	signal.Status = EntryDone
+	signal.LeaseUntil = nil
+	signal.CompletedAt = &now
+	return nil
+}
+
+func failEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt int, cause error) error {
 	entry := entries[key]
 	if entry == nil {
 		return ErrEntryNotFound
 	}
-	if entry.Status != EntryProcessing || entry.Owner != owner {
+	if entry.Status != EntryProcessing || entry.Owner != owner || entry.Attempts != attempt {
 		return ErrEntryNotOwned
 	}
 	entry.Status = EntryFailed
@@ -300,6 +459,23 @@ func failEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, cause er
 	entry.LeaseUntil = nil
 	if cause != nil {
 		entry.LastError = cause.Error()
+	}
+	return nil
+}
+
+func failSignal(signals map[string]*SignalRecord, id string, owner string, attempt int, cause error) error {
+	signal := signals[id]
+	if signal == nil {
+		return ErrSignalNotFound
+	}
+	if signal.Status != EntryProcessing || signal.Owner != owner || signal.Attempts != attempt {
+		return ErrSignalNotOwned
+	}
+	signal.Status = EntryFailed
+	signal.Owner = ""
+	signal.LeaseUntil = nil
+	if cause != nil {
+		signal.LastError = cause.Error()
 	}
 	return nil
 }
@@ -316,6 +492,14 @@ func cloneEntries(in map[EntryKey]*Entry) map[EntryKey]*Entry {
 	out := make(map[EntryKey]*Entry, len(in))
 	for key, entry := range in {
 		out[key] = cloneEntry(entry)
+	}
+	return out
+}
+
+func cloneSignalRecords(in map[string]*SignalRecord) map[string]*SignalRecord {
+	out := make(map[string]*SignalRecord, len(in))
+	for key, signal := range in {
+		out[key] = cloneSignalRecord(signal)
 	}
 	return out
 }
@@ -355,4 +539,38 @@ func cloneEntry(entry *Entry) *Entry {
 		CompletedAt: cloneTime(entry.CompletedAt),
 		LastError:   entry.LastError,
 	}
+}
+
+func cloneSignalRecord(signal *SignalRecord) *SignalRecord {
+	if signal == nil {
+		return nil
+	}
+	return &SignalRecord{
+		Signal: Signal{
+			ID:        signal.ID,
+			MachineID: signal.MachineID,
+			Trigger:   signal.Trigger,
+			Args:      cloneArgs(signal.Args),
+		},
+		TargetShardID: signal.TargetShardID,
+		Status:        signal.Status,
+		Owner:         signal.Owner,
+		LeaseUntil:    cloneTime(signal.LeaseUntil),
+		Attempts:      signal.Attempts,
+		CreatedAt:     signal.CreatedAt,
+		StartedAt:     cloneTime(signal.StartedAt),
+		CompletedAt:   cloneTime(signal.CompletedAt),
+		LastError:     signal.LastError,
+	}
+}
+
+func cloneSignalRecordValues(signals []SignalRecord) []SignalRecord {
+	if len(signals) == 0 {
+		return nil
+	}
+	out := make([]SignalRecord, len(signals))
+	for i := range signals {
+		out[i] = *cloneSignalRecord(&signals[i])
+	}
+	return out
 }

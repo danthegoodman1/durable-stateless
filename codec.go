@@ -50,8 +50,27 @@ func cloneArgs(args []any) []any {
 	if len(args) == 0 {
 		return nil
 	}
+	raw, err := json.Marshal(args)
+	if err == nil {
+		var out []any
+		if err := json.Unmarshal(raw, &out); err == nil {
+			return out
+		}
+	}
 	out := make([]any, len(args))
 	copy(out, args)
+	return out
+}
+
+func cloneSignals(signals []Signal) []Signal {
+	if len(signals) == 0 {
+		return nil
+	}
+	out := make([]Signal, len(signals))
+	for i, signal := range signals {
+		out[i] = signal
+		out[i].Args = cloneArgs(signal.Args)
+	}
 	return out
 }
 
