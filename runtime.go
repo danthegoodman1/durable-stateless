@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/qmuntal/stateless"
@@ -55,16 +56,19 @@ type Runtime struct {
 	lease         time.Duration
 	renewInterval time.Duration
 	retryPolicy   RetryPolicy
+	shardMu       sync.RWMutex
+	machineShards map[string]ShardID
 }
 
 // NewRuntime creates a Runtime. By default all machines are placed on shard 0.
 func NewRuntime(provider Provider, def Definition, options ...Option) *Runtime {
 	r := &Runtime{
-		provider:    provider,
-		def:         def,
-		sharder:     MustHashSharder(1),
-		lease:       DefaultLeaseDuration,
-		retryPolicy: DefaultRetryPolicy(),
+		provider:      provider,
+		def:           def,
+		sharder:       MustHashSharder(1),
+		lease:         DefaultLeaseDuration,
+		retryPolicy:   DefaultRetryPolicy(),
+		machineShards: make(map[string]ShardID),
 	}
 	for _, option := range options {
 		option(r)
@@ -90,13 +94,18 @@ func (r *Runtime) CreateMachineInShard(ctx context.Context, shard ShardID, init 
 	if err := validateShardID(shard); err != nil {
 		return err
 	}
-	return r.provider.CreateMachine(ctx, MachineRecord{
+	err := r.provider.CreateMachine(ctx, MachineRecord{
 		ID:       init.ID,
 		ShardID:  shard,
 		State:    init.State,
 		Args:     cloneArgs(init.Args),
 		Terminal: r.def.IsTerminal(init.State),
 	})
+	if err != nil {
+		return err
+	}
+	r.rememberMachineShard(init.ID, shard)
+	return nil
 }
 
 // ReadMachine returns the provider's durable current-state projection.
@@ -104,7 +113,12 @@ func (r *Runtime) ReadMachine(ctx context.Context, id string) (*Snapshot, error)
 	if err := r.validate(); err != nil {
 		return nil, err
 	}
-	return r.provider.ReadMachine(ctx, id)
+	snap, err := r.provider.ReadMachine(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	r.rememberMachineShard(snap.ID, snap.ShardID)
+	return snap, nil
 }
 
 // Signal durably enqueues a trigger message for a machine. The signal is not
@@ -156,9 +170,14 @@ func (r *Runtime) prepareSignal(ctx context.Context, signal Signal) (SignalRecor
 	if _, err := encodeArgs(signal.Args); err != nil {
 		return SignalRecord{}, err
 	}
-	snap, err := r.provider.ReadMachine(ctx, signal.MachineID)
-	if err != nil {
-		return SignalRecord{}, err
+	shard, ok := r.cachedMachineShard(signal.MachineID)
+	if !ok {
+		snap, err := r.provider.ReadMachine(ctx, signal.MachineID)
+		if err != nil {
+			return SignalRecord{}, err
+		}
+		shard = snap.ShardID
+		r.rememberMachineShard(signal.MachineID, shard)
 	}
 	return SignalRecord{
 		Signal: Signal{
@@ -167,7 +186,7 @@ func (r *Runtime) prepareSignal(ctx context.Context, signal Signal) (SignalRecor
 			Trigger:   trigger,
 			Args:      cloneArgs(signal.Args),
 		},
-		TargetShardID: snap.ShardID,
+		TargetShardID: shard,
 		Status:        EntryPending,
 	}, nil
 }
@@ -185,6 +204,25 @@ func (r *Runtime) prepareSignals(ctx context.Context, signals []Signal) ([]Signa
 		records = append(records, record)
 	}
 	return records, nil
+}
+
+func (r *Runtime) cachedMachineShard(id string) (ShardID, bool) {
+	r.shardMu.RLock()
+	defer r.shardMu.RUnlock()
+	shard, ok := r.machineShards[id]
+	return shard, ok
+}
+
+func (r *Runtime) rememberMachineShard(id string, shard ShardID) {
+	if id == "" {
+		return
+	}
+	r.shardMu.Lock()
+	defer r.shardMu.Unlock()
+	if r.machineShards == nil {
+		r.machineShards = make(map[string]ShardID)
+	}
+	r.machineShards[id] = shard
 }
 
 func (r *Runtime) buildCommit(ctx context.Context, snap *Snapshot, trigger stateless.Trigger, args ...any) (cmd *CommitTransition, err error) {
@@ -279,6 +317,7 @@ type Worker struct {
 	shards        []ShardID
 	lease         time.Duration
 	renewInterval time.Duration
+	leases        []ShardLease
 }
 
 // Work processes up to limit successful units of work for the worker's shards.
@@ -294,22 +333,19 @@ func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 		return 0, nil
 	}
 
-	leases, err := w.runtime.provider.AcquireShardLeases(ctx, w.id, w.shards, w.lease)
+	leases, err := w.leasesForWork(ctx)
 	if err != nil {
 		return 0, err
 	}
 	if len(leases) == 0 {
 		return 0, nil
 	}
-	workCtx, stopRenewal := w.renewShardLeasesWhileWorking(ctx, leases)
+	renewer := newWorkerLeaseRenewer(w, leases)
 
 	processed := 0
 	var errs []error
 	hadEntryError := false
 	finish := func(err error) (int, error) {
-		if stopErr := stopRenewal(); stopErr != nil {
-			err = errors.Join(err, stopErr)
-		}
 		return processed, err
 	}
 
@@ -317,12 +353,18 @@ func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 		if available <= 0 {
 			return nil
 		}
-		entries, err := w.runtime.provider.ClaimEntries(workCtx, leases, available)
+		if err := renewer.renewIfNeeded(ctx); err != nil {
+			return err
+		}
+		entries, err := w.runtime.provider.ClaimEntries(ctx, renewer.leases, available)
 		if err != nil {
 			return err
 		}
 		for _, entry := range entries {
-			if err := w.processEntry(workCtx, entry); err != nil {
+			err := renewer.runWithBackground(ctx, func(workCtx context.Context) error {
+				return w.processEntry(workCtx, entry)
+			})
+			if err != nil {
 				hadEntryError = true
 				errs = append(errs, err)
 				continue
@@ -336,12 +378,19 @@ func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 		if available <= 0 {
 			return nil
 		}
-		signals, err := w.runtime.provider.ClaimSignals(workCtx, leases, available)
+		if err := renewer.renewIfNeeded(ctx); err != nil {
+			return err
+		}
+		signals, err := w.runtime.provider.ClaimSignals(ctx, renewer.leases, available)
 		if err != nil {
 			return err
 		}
 		for _, signal := range signals {
-			if err := w.processSignal(workCtx, signal); err != nil {
+			if err := renewer.renewIfNeeded(ctx); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if err := w.processSignal(ctx, signal); err != nil {
 				errs = append(errs, err)
 				continue
 			}
@@ -365,6 +414,29 @@ func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 	}
 
 	return finish(errors.Join(errs...))
+}
+
+func (w *Worker) leasesForWork(ctx context.Context) ([]ShardLease, error) {
+	now := nowUTC()
+	if cachedLeasesUsable(w.leases, w.shards, now, w.renewInterval) {
+		return w.leases, nil
+	}
+
+	if len(w.leases) > 0 {
+		renewed, err := w.runtime.provider.RenewShardLeases(ctx, w.id, w.leases, w.lease)
+		if err == nil && leasesCoverShards(renewed, w.shards) {
+			w.leases = renewed
+			return w.leases, nil
+		}
+		w.leases = nil
+	}
+
+	leases, err := w.runtime.provider.AcquireShardLeases(ctx, w.id, w.shards, w.lease)
+	if err != nil {
+		return nil, err
+	}
+	w.leases = leases
+	return w.leases, nil
 }
 
 func (w *Worker) processSignal(ctx context.Context, signal SignalRecord) error {
@@ -494,9 +566,54 @@ func (w *Worker) processEntry(ctx context.Context, entry Entry) error {
 	return nil
 }
 
-func (w *Worker) renewShardLeasesWhileWorking(ctx context.Context, leases []ShardLease) (context.Context, func() error) {
-	if w.lease <= 0 || w.renewInterval <= 0 {
-		return ctx, func() error { return nil }
+type workerLeaseRenewer struct {
+	worker      *Worker
+	leases      []ShardLease
+	nextRenewAt time.Time
+}
+
+func newWorkerLeaseRenewer(worker *Worker, leases []ShardLease) *workerLeaseRenewer {
+	renewer := &workerLeaseRenewer{
+		worker: worker,
+		leases: leases,
+	}
+	renewer.scheduleNextRenewal(nowUTC())
+	return renewer
+}
+
+func (r *workerLeaseRenewer) renewIfNeeded(ctx context.Context) error {
+	if r.worker.lease <= 0 || r.worker.renewInterval <= 0 || r.nextRenewAt.IsZero() {
+		return nil
+	}
+	if nowUTC().Before(r.nextRenewAt) {
+		return nil
+	}
+	return r.renew(ctx)
+}
+
+func (r *workerLeaseRenewer) renew(ctx context.Context) error {
+	now := nowUTC()
+	renewed, err := r.worker.runtime.provider.RenewShardLeases(ctx, r.worker.id, r.leases, r.worker.lease)
+	if err != nil {
+		return err
+	}
+	r.leases = renewed
+	r.worker.leases = renewed
+	r.scheduleNextRenewal(now)
+	return nil
+}
+
+func (r *workerLeaseRenewer) scheduleNextRenewal(now time.Time) {
+	if r.worker.lease <= 0 || r.worker.renewInterval <= 0 {
+		r.nextRenewAt = time.Time{}
+		return
+	}
+	r.nextRenewAt = now.Add(r.worker.renewInterval)
+}
+
+func (r *workerLeaseRenewer) runWithBackground(ctx context.Context, fn func(context.Context) error) error {
+	if r.worker.lease <= 0 || r.worker.renewInterval <= 0 {
+		return fn(ctx)
 	}
 
 	workCtx, cancel := context.WithCancel(ctx)
@@ -506,7 +623,7 @@ func (w *Worker) renewShardLeasesWhileWorking(ctx context.Context, leases []Shar
 
 	go func() {
 		defer close(stopped)
-		ticker := time.NewTicker(w.renewInterval)
+		ticker := time.NewTicker(r.worker.renewInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -515,7 +632,7 @@ func (w *Worker) renewShardLeasesWhileWorking(ctx context.Context, leases []Shar
 			case <-workCtx.Done():
 				return
 			case <-ticker.C:
-				if _, err := w.runtime.provider.RenewShardLeases(ctx, w.id, leases, w.lease); err != nil {
+				if err := r.renew(ctx); err != nil {
 					select {
 					case errCh <- err:
 					default:
@@ -527,26 +644,15 @@ func (w *Worker) renewShardLeasesWhileWorking(ctx context.Context, leases []Shar
 		}
 	}()
 
-	called := false
-	return workCtx, func() error {
-		if called {
-			select {
-			case err := <-errCh:
-				return err
-			default:
-				return nil
-			}
-		}
-		called = true
-		close(done)
-		cancel()
-		<-stopped
-		select {
-		case err := <-errCh:
-			return err
-		default:
-			return nil
-		}
+	err := fn(workCtx)
+	close(done)
+	cancel()
+	<-stopped
+	select {
+	case renewErr := <-errCh:
+		return errors.Join(err, renewErr)
+	default:
+		return err
 	}
 }
 
@@ -633,4 +739,44 @@ func cloneShards(shards []ShardID) []ShardID {
 	out := make([]ShardID, len(shards))
 	copy(out, shards)
 	return out
+}
+
+func cachedLeasesUsable(leases []ShardLease, shards []ShardID, now time.Time, refreshWindow time.Duration) bool {
+	if !leasesCoverShards(leases, shards) {
+		return false
+	}
+	refreshAt := now
+	if refreshWindow > 0 {
+		refreshAt = now.Add(refreshWindow)
+	}
+	for _, lease := range leases {
+		if !lease.LeaseUntil.After(refreshAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func leasesCoverShards(leases []ShardLease, shards []ShardID) bool {
+	if len(shards) == 0 || len(leases) < len(shards) {
+		return false
+	}
+	if len(shards) == 1 {
+		for _, lease := range leases {
+			if lease.ShardID == shards[0] {
+				return true
+			}
+		}
+		return false
+	}
+	owned := make(map[ShardID]struct{}, len(leases))
+	for _, lease := range leases {
+		owned[lease.ShardID] = struct{}{}
+	}
+	for _, shard := range shards {
+		if _, ok := owned[shard]; !ok {
+			return false
+		}
+	}
+	return true
 }
