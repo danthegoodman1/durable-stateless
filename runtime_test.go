@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -134,7 +135,7 @@ func TestRejectsNegativeShardIDs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			provider := tc.new(t)
-			rt := newTestRuntime(t, provider, testDefinition{})
+			rt := newTestRuntime(t, provider, testDefinition{}, WithRetryPolicy(RetryPolicy{}))
 
 			if err := rt.CreateMachineInShard(ctx, -1, MachineInit{ID: "m1", State: stateIdle}); !errors.Is(err, ErrInvalidShard) {
 				t.Fatalf("expected invalid shard on create, got %v", err)
@@ -152,7 +153,7 @@ func TestSignalInvalidTriggerDoesNotMutateState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			provider := tc.new(t)
-			rt := newTestRuntime(t, provider, testDefinition{})
+			rt := newTestRuntime(t, provider, testDefinition{}, WithRetryPolicy(RetryPolicy{}))
 			createMachine(t, ctx, rt, "m1", 7, stateIdle)
 
 			if err := rt.Signal(ctx, NewSignal("s1", "m1", "bogus")); err != nil {
@@ -303,7 +304,7 @@ func TestEntryCompletionAndNextTriggerAreAtomic(t *testing.T) {
 						return FireNext("bogus"), nil
 					},
 				},
-			})
+			}, WithRetryPolicy(RetryPolicy{}))
 			createMachine(t, ctx, rt, "m1", 5, stateIdle)
 			processSignal(t, ctx, rt, provider, "worker", 5, NewSignal("s1", "m1", triggerStart))
 
@@ -604,7 +605,7 @@ func TestHandlerSignalConflictRollsBackEntryCompletion(t *testing.T) {
 						return EmitSignals(NewSignal(entry.Key.String()+":notify", "m2", triggerFinish, "new")), nil
 					},
 				},
-			})
+			}, WithRetryPolicy(RetryPolicy{}))
 			createMachine(t, ctx, rt, "m1", 23, stateIdle)
 			createMachine(t, ctx, rt, "m2", 24, stateIdle)
 			if err := rt.Signal(ctx, NewSignal("m1/1:notify", "m2", triggerFinish, "old")); err != nil {
@@ -800,7 +801,7 @@ func TestWorkContinuesAfterEntryFailure(t *testing.T) {
 						return NoNext(), nil
 					},
 				},
-			})
+			}, WithRetryPolicy(RetryPolicy{}))
 			for _, id := range []string{"m1", "m2"} {
 				createMachine(t, ctx, rt, id, 12, stateIdle)
 				processSignal(t, ctx, rt, provider, "signal-worker", 12, NewSignal("s-"+id, id, triggerStart))
@@ -954,7 +955,7 @@ func TestProcessEntryFailsEntryWhenHandlerFails(t *testing.T) {
 						return NoNext(), handlerErr
 					},
 				},
-			})
+			}, WithRetryPolicy(RetryPolicy{}))
 			createMachine(t, ctx, rt, "m1", 6, stateIdle)
 			processSignal(t, ctx, rt, provider, "signal-worker", 6, NewSignal("s1", "m1", triggerStart))
 
@@ -966,6 +967,213 @@ func TestProcessEntryFailsEntryWhenHandlerFails(t *testing.T) {
 			reclaimed := claimEntries(t, ctx, provider, "worker-2", 6, 10, time.Second)
 			if len(reclaimed) != 1 || reclaimed[0].LastError != handlerErr.Error() {
 				t.Fatalf("expected failed entry with error, got %+v", reclaimed)
+			}
+		})
+	}
+}
+
+func TestRetryBackoffDelaysFailedEntryAndSignal(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			handlerErr := errors.New("handler failed")
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{
+				handlers: map[string]EntryHandler{
+					stateWorking: func(context.Context, Entry) (HandlerResult, error) {
+						return NoNext(), handlerErr
+					},
+				},
+			}, WithRetryPolicy(RetryPolicy{InitialBackoff: 30 * time.Millisecond}))
+			createMachine(t, ctx, rt, "entry-machine", 30, stateIdle)
+			processSignal(t, ctx, rt, provider, "signal-worker", 30, NewSignal("s-entry", "entry-machine", triggerStart))
+
+			_, err := rt.Worker(WorkerConfig{ID: "entry-worker", Shards: []ShardID{30}}).Work(ctx, 10)
+			if !errors.Is(err, handlerErr) {
+				t.Fatalf("expected handler error, got %v", err)
+			}
+			if entries := claimEntries(t, ctx, provider, "inspector", 30, 10, time.Second); len(entries) != 0 {
+				t.Fatalf("failed entry should wait for retry_at, got %+v", entries)
+			}
+			time.Sleep(45 * time.Millisecond)
+			entries := claimEntries(t, ctx, provider, "inspector", 30, 10, time.Second)
+			if len(entries) != 1 || entries[0].Attempts != 2 || entries[0].LastError != handlerErr.Error() {
+				t.Fatalf("expected entry after backoff with second attempt, got %+v", entries)
+			}
+
+			createMachine(t, ctx, rt, "signal-machine", 31, stateIdle)
+			if err := rt.Signal(ctx, NewSignal("s-bogus", "signal-machine", "bogus")); err != nil {
+				t.Fatalf("signal bogus: %v", err)
+			}
+			_, err = rt.Worker(WorkerConfig{ID: "signal-worker", Shards: []ShardID{31}}).Work(ctx, 10)
+			if err == nil {
+				t.Fatal("expected invalid signal error")
+			}
+			if signals := claimSignals(t, ctx, provider, "inspector", 31, 10, time.Second); len(signals) != 0 {
+				t.Fatalf("failed signal should wait for retry_at, got %+v", signals)
+			}
+			time.Sleep(45 * time.Millisecond)
+			signals := claimSignals(t, ctx, provider, "inspector", 31, 10, time.Second)
+			if len(signals) != 1 || signals[0].Attempts != 2 || signals[0].LastError == "" {
+				t.Fatalf("expected signal after backoff with second attempt, got %+v", signals)
+			}
+		})
+	}
+}
+
+func TestRetryPolicyDeadLettersAfterMaxAttempts(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			handlerErr := errors.New("handler failed")
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{
+				handlers: map[string]EntryHandler{
+					stateWorking: func(context.Context, Entry) (HandlerResult, error) {
+						return NoNext(), handlerErr
+					},
+				},
+			}, WithRetryPolicy(RetryPolicy{MaxAttempts: 1}))
+			createMachine(t, ctx, rt, "m1", 32, stateIdle)
+			processSignal(t, ctx, rt, provider, "signal-worker", 32, NewSignal("s1", "m1", triggerStart))
+
+			_, err := rt.Worker(WorkerConfig{ID: "worker", Shards: []ShardID{32}}).Work(ctx, 10)
+			if !errors.Is(err, handlerErr) {
+				t.Fatalf("expected handler error, got %v", err)
+			}
+			if entries := claimEntries(t, ctx, provider, "worker-2", 32, 10, -time.Second); len(entries) != 0 {
+				t.Fatalf("dead-lettered entry should not be claimable, got %+v", entries)
+			}
+			_, err = provider.Commit(ctx, AtomicCommit{
+				Transition: &CommitTransition{
+					MachineID:       "m1",
+					ExpectedVersion: 1,
+					Record: TransitionRecord{
+						SourceState: stateWorking,
+						DestState:   stateDone,
+						Trigger:     triggerFinish,
+						Terminal:    true,
+					},
+				},
+			})
+			if !errors.Is(err, ErrEntryInProgress) {
+				t.Fatalf("dead-lettered entry should still block machine advancement, got %v", err)
+			}
+
+			createMachine(t, ctx, rt, "m2", 33, stateIdle)
+			if err := rt.Signal(ctx, NewSignal("s2", "m2", "bogus")); err != nil {
+				t.Fatalf("signal bogus: %v", err)
+			}
+			_, err = rt.Worker(WorkerConfig{ID: "signal-worker", Shards: []ShardID{33}}).Work(ctx, 10)
+			if err == nil {
+				t.Fatal("expected invalid signal error")
+			}
+			if signals := claimSignals(t, ctx, provider, "worker-2", 33, 10, -time.Second); len(signals) != 0 {
+				t.Fatalf("dead-lettered signal should not be claimable, got %+v", signals)
+			}
+		})
+	}
+}
+
+func TestRenewingEntryLeasePreventsStealDuringLongHandler(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var calls atomic.Int32
+			started := make(chan struct{})
+			release := make(chan struct{})
+
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{
+				handlers: map[string]EntryHandler{
+					stateWorking: func(ctx context.Context, _ Entry) (HandlerResult, error) {
+						if calls.Add(1) == 1 {
+							close(started)
+						}
+						select {
+						case <-release:
+							return NoNext(), nil
+						case <-ctx.Done():
+							return NoNext(), ctx.Err()
+						}
+					},
+				},
+			},
+				WithLeaseDuration(40*time.Millisecond),
+				WithLeaseRenewalInterval(10*time.Millisecond),
+				WithRetryPolicy(RetryPolicy{}),
+			)
+			createMachine(t, ctx, rt, "m1", 34, stateIdle)
+			processSignal(t, ctx, rt, provider, "signal-worker", 34, NewSignal("s1", "m1", triggerStart))
+
+			done := make(chan error, 1)
+			go func() {
+				processed, err := rt.Worker(WorkerConfig{ID: "worker-a", Shards: []ShardID{34}}).Work(ctx, 1)
+				if err != nil {
+					done <- err
+					return
+				}
+				if processed != 1 {
+					done <- fmt.Errorf("expected worker-a to process one entry, got %d", processed)
+					return
+				}
+				done <- nil
+			}()
+
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("handler did not start")
+			}
+
+			time.Sleep(90 * time.Millisecond)
+			stealCtx, cancel := context.WithTimeout(ctx, 80*time.Millisecond)
+			processed, err := rt.Worker(WorkerConfig{ID: "worker-b", Shards: []ShardID{34}}).Work(stealCtx, 1)
+			cancel()
+			if err != nil {
+				t.Fatalf("worker-b should not steal renewed entry: %v", err)
+			}
+			if processed != 0 {
+				t.Fatalf("worker-b should not process renewed entry, got %d", processed)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("handler should have run once while lease renewed, got %d", calls.Load())
+			}
+
+			close(release)
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("worker-a: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("worker-a did not finish")
+			}
+		})
+	}
+}
+
+func TestRenewSignalLeasePreventsExpiredClaim(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{})
+			createMachine(t, ctx, rt, "m1", 35, stateIdle)
+			if err := rt.Signal(ctx, NewSignal("s1", "m1", triggerStart)); err != nil {
+				t.Fatalf("signal: %v", err)
+			}
+
+			claimed := claimSignals(t, ctx, provider, "worker-a", 35, 1, 20*time.Millisecond)
+			if len(claimed) != 1 {
+				t.Fatalf("expected signal claim, got %+v", claimed)
+			}
+			if err := provider.RenewSignalLease(ctx, claimed[0].ID, claimed[0].Owner, claimed[0].Attempts, 100*time.Millisecond); err != nil {
+				t.Fatalf("renew signal lease: %v", err)
+			}
+			time.Sleep(40 * time.Millisecond)
+			if signals := claimSignals(t, ctx, provider, "worker-b", 35, 1, time.Second); len(signals) != 0 {
+				t.Fatalf("renewed signal lease should not be claimable, got %+v", signals)
 			}
 		})
 	}

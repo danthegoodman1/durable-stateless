@@ -59,6 +59,7 @@ func (p *SQLiteProvider) Migrate(ctx context.Context) error {
 			status text not null,
 			owner text,
 			lease_until text,
+			retry_at text,
 			attempts integer not null default 0,
 			created_at text not null,
 			started_at text,
@@ -76,6 +77,7 @@ func (p *SQLiteProvider) Migrate(ctx context.Context) error {
 			status text not null,
 			owner text,
 			lease_until text,
+			retry_at text,
 			attempts integer not null default 0,
 			created_at text not null,
 			started_at text,
@@ -83,14 +85,31 @@ func (p *SQLiteProvider) Migrate(ctx context.Context) error {
 			last_error text,
 			foreign key(machine_id) references machines(id)
 		)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := p.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	if err := addColumnIfMissing(ctx, p.db, "machine_entries", "retry_at", "text"); err != nil {
+		return err
+	}
+	if err := addColumnIfMissing(ctx, p.db, "machine_signals", "retry_at", "text"); err != nil {
+		return err
+	}
+	indexes := []string{
 		`create index if not exists machine_entries_claim_idx
 			on machine_entries(status, lease_until, created_at)`,
+		`create index if not exists machine_entries_retry_claim_idx
+			on machine_entries(status, retry_at, lease_until, created_at)`,
 		`create index if not exists machine_signals_claim_idx
 			on machine_signals(target_shard_id, status, lease_until, created_at)`,
+		`create index if not exists machine_signals_retry_claim_idx
+			on machine_signals(target_shard_id, status, retry_at, lease_until, created_at)`,
 		`create index if not exists machines_shard_idx
 			on machines(shard_id, terminal_at)`,
 	}
-	for _, stmt := range stmts {
+	for _, stmt := range indexes {
 		if _, err := p.db.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
@@ -164,12 +183,13 @@ func (p *SQLiteProvider) ClaimSignals(ctx context.Context, owner string, shards 
 		args = append(args, shard)
 	}
 	now := nowUTC()
-	args = append(args, formatTime(now), limit)
+	args = append(args, formatTime(now), formatTime(now), limit)
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
 		`select id
 		   from machine_signals
 		  where target_shard_id in (%s)
-		    and (status in ('pending', 'failed')
+		    and (status = 'pending'
+		      or (status = 'failed' and (retry_at is null or retry_at <= ?))
 		      or (status = 'processing' and (lease_until is null or lease_until < ?)))
 		  order by created_at, id
 		  limit ?`, strings.Join(placeholders, ",")), args...)
@@ -199,6 +219,7 @@ func (p *SQLiteProvider) ClaimSignals(ctx context.Context, owner string, shards 
 			    set status = 'processing',
 			        owner = ?,
 			        lease_until = ?,
+			        retry_at = null,
 			        attempts = attempts + 1,
 			        started_at = ?
 			  where id = ?`,
@@ -258,7 +279,7 @@ func (p *SQLiteProvider) ClaimEntries(ctx context.Context, owner string, shards 
 		args = append(args, shard)
 	}
 	now := nowUTC()
-	args = append(args, formatTime(now), limit)
+	args = append(args, formatTime(now), formatTime(now), limit)
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
 		`select e.machine_id, e.version
 		   from machine_entries e
@@ -266,7 +287,8 @@ func (p *SQLiteProvider) ClaimEntries(ctx context.Context, owner string, shards 
 		  where m.shard_id in (%s)
 		    and m.terminal_at is null
 		    and e.version = m.version
-		    and (e.status in ('pending', 'failed')
+		    and (e.status = 'pending'
+		      or (e.status = 'failed' and (e.retry_at is null or e.retry_at <= ?))
 		      or (e.status = 'processing' and (e.lease_until is null or e.lease_until < ?)))
 		  order by e.created_at, e.machine_id, e.version
 		  limit ?`, strings.Join(placeholders, ",")), args...)
@@ -296,6 +318,7 @@ func (p *SQLiteProvider) ClaimEntries(ctx context.Context, owner string, shards 
 			    set status = 'processing',
 			        owner = ?,
 			        lease_until = ?,
+			        retry_at = null,
 			        attempts = attempts + 1,
 			        started_at = ?
 			  where machine_id = ? and version = ?`,
@@ -375,12 +398,20 @@ func (p *SQLiteProvider) Commit(ctx context.Context, cmd AtomicCommit) (*CommitR
 	}, nil
 }
 
-func (p *SQLiteProvider) FailEntry(ctx context.Context, key EntryKey, owner string, attempt int, cause error) error {
-	return failEntrySQL(ctx, p.db, key, owner, attempt, cause)
+func (p *SQLiteProvider) RenewSignalLease(ctx context.Context, id string, owner string, attempt int, lease time.Duration) error {
+	return renewSignalLeaseSQL(ctx, p.db, id, owner, attempt, lease)
 }
 
-func (p *SQLiteProvider) FailSignal(ctx context.Context, id string, owner string, attempt int, cause error) error {
-	return failSignalSQL(ctx, p.db, id, owner, attempt, cause)
+func (p *SQLiteProvider) RenewEntryLease(ctx context.Context, key EntryKey, owner string, attempt int, lease time.Duration) error {
+	return renewEntryLeaseSQL(ctx, p.db, key, owner, attempt, lease)
+}
+
+func (p *SQLiteProvider) FailEntry(ctx context.Context, key EntryKey, owner string, attempt int, failure Failure) error {
+	return failEntrySQL(ctx, p.db, key, owner, attempt, failure)
+}
+
+func (p *SQLiteProvider) FailSignal(ctx context.Context, id string, owner string, attempt int, failure Failure) error {
+	return failSignalSQL(ctx, p.db, id, owner, attempt, failure)
 }
 
 type sqlRunner interface {
@@ -403,6 +434,33 @@ func rollbackUnlessCommitted(conn *sql.Conn, committed *bool) {
 	if !*committed {
 		_, _ = conn.ExecContext(context.Background(), `rollback`)
 	}
+}
+
+func addColumnIfMissing(ctx context.Context, db *sql.DB, table string, column string, definition string) error {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(`pragma table_info(%s)`, table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name string
+		var typ string
+		var notNull int
+		var defaultValue sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf(`alter table %s add column %s %s`, table, column, definition))
+	return err
 }
 
 func enqueueSignalSQL(ctx context.Context, q sqlRunner, signal SignalRecord) error {
@@ -599,7 +657,7 @@ func readEntrySQL(ctx context.Context, q sqlRunner, key EntryKey) (*Entry, error
 	row := q.QueryRowContext(ctx,
 		`select e.machine_id, e.version, m.shard_id,
 		        e.source_state, e.dest_state, e.trigger, e.args_json,
-		        e.status, coalesce(e.owner, ''), e.lease_until, e.attempts,
+		        e.status, coalesce(e.owner, ''), e.lease_until, e.retry_at, e.attempts,
 		        e.created_at, e.started_at, e.completed_at, coalesce(e.last_error, '')
 		   from machine_entries e
 		   join machines m on m.id = e.machine_id
@@ -609,12 +667,12 @@ func readEntrySQL(ctx context.Context, q sqlRunner, key EntryKey) (*Entry, error
 	var argsJSON string
 	var source, dest, trigger string
 	var shard int
-	var leaseRaw, startedRaw, completedRaw sql.NullString
+	var leaseRaw, retryRaw, startedRaw, completedRaw sql.NullString
 	var createdRaw string
 	err := row.Scan(
 		&entry.Key.MachineID, &entry.Key.Version, &shard,
 		&source, &dest, &trigger, &argsJSON,
-		&entry.Status, &entry.Owner, &leaseRaw, &entry.Attempts,
+		&entry.Status, &entry.Owner, &leaseRaw, &retryRaw, &entry.Attempts,
 		&createdRaw, &startedRaw, &completedRaw, &entry.LastError,
 	)
 	if err == sql.ErrNoRows {
@@ -635,6 +693,10 @@ func readEntrySQL(ctx context.Context, q sqlRunner, key EntryKey) (*Entry, error
 	if err != nil {
 		return nil, err
 	}
+	retryAt, err := parseOptionalTime(retryRaw)
+	if err != nil {
+		return nil, err
+	}
 	startedAt, err := parseOptionalTime(startedRaw)
 	if err != nil {
 		return nil, err
@@ -650,6 +712,7 @@ func readEntrySQL(ctx context.Context, q sqlRunner, key EntryKey) (*Entry, error
 	entry.Trigger = trigger
 	entry.CreatedAt = createdAt
 	entry.LeaseUntil = leaseUntil
+	entry.RetryAt = retryAt
 	entry.StartedAt = startedAt
 	entry.CompletedAt = completedAt
 	return &entry, nil
@@ -658,7 +721,7 @@ func readEntrySQL(ctx context.Context, q sqlRunner, key EntryKey) (*Entry, error
 func readSignalSQL(ctx context.Context, q sqlRunner, id string) (*SignalRecord, error) {
 	row := q.QueryRowContext(ctx,
 		`select id, machine_id, target_shard_id, trigger, args_json,
-		        status, coalesce(owner, ''), lease_until, attempts,
+		        status, coalesce(owner, ''), lease_until, retry_at, attempts,
 		        created_at, started_at, completed_at, coalesce(last_error, '')
 		   from machine_signals
 		  where id = ?`, id)
@@ -667,11 +730,11 @@ func readSignalSQL(ctx context.Context, q sqlRunner, id string) (*SignalRecord, 
 	var argsJSON string
 	var trigger string
 	var shard int
-	var leaseRaw, startedRaw, completedRaw sql.NullString
+	var leaseRaw, retryRaw, startedRaw, completedRaw sql.NullString
 	var createdRaw string
 	err := row.Scan(
 		&signal.ID, &signal.MachineID, &shard, &trigger, &argsJSON,
-		&signal.Status, &signal.Owner, &leaseRaw, &signal.Attempts,
+		&signal.Status, &signal.Owner, &leaseRaw, &retryRaw, &signal.Attempts,
 		&createdRaw, &startedRaw, &completedRaw, &signal.LastError,
 	)
 	if err == sql.ErrNoRows {
@@ -692,6 +755,10 @@ func readSignalSQL(ctx context.Context, q sqlRunner, id string) (*SignalRecord, 
 	if err != nil {
 		return nil, err
 	}
+	retryAt, err := parseOptionalTime(retryRaw)
+	if err != nil {
+		return nil, err
+	}
 	startedAt, err := parseOptionalTime(startedRaw)
 	if err != nil {
 		return nil, err
@@ -705,6 +772,7 @@ func readSignalSQL(ctx context.Context, q sqlRunner, id string) (*SignalRecord, 
 	signal.Args = args
 	signal.CreatedAt = createdAt
 	signal.LeaseUntil = leaseUntil
+	signal.RetryAt = retryAt
 	signal.StartedAt = startedAt
 	signal.CompletedAt = completedAt
 	return &signal, nil
@@ -716,6 +784,7 @@ func completeEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner stri
 		`update machine_entries
 		    set status = 'done',
 		        lease_until = null,
+		        retry_at = null,
 		        completed_at = ?
 		  where machine_id = ?
 		    and version = ?
@@ -739,6 +808,7 @@ func completeSignalSQL(ctx context.Context, q sqlRunner, id string, owner string
 		`update machine_signals
 		    set status = 'done',
 		        lease_until = null,
+		        retry_at = null,
 		        completed_at = ?
 		  where id = ?
 		    and status = 'processing'
@@ -755,23 +825,17 @@ func completeSignalSQL(ctx context.Context, q sqlRunner, id string, owner string
 	return resolveSignalCompleteMiss(ctx, q, id, owner, attempt, true)
 }
 
-func failEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, attempt int, cause error) error {
-	message := ""
-	if cause != nil {
-		message = cause.Error()
-	}
+func renewEntryLeaseSQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, attempt int, lease time.Duration) error {
+	leaseUntil := nowUTC().Add(lease)
 	res, err := q.ExecContext(ctx,
 		`update machine_entries
-		    set status = 'failed',
-		        owner = null,
-		        lease_until = null,
-		        last_error = ?
+		    set lease_until = ?
 		  where machine_id = ?
 		    and version = ?
 		    and status = 'processing'
 		    and owner = ?
 		    and attempts = ?`,
-		message, key.MachineID, key.Version, owner, attempt,
+		formatTime(leaseUntil), key.MachineID, key.Version, owner, attempt,
 	)
 	if err != nil {
 		return err
@@ -782,22 +846,83 @@ func failEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, 
 	return resolveEntryCompleteMiss(ctx, q, key, owner, attempt, false)
 }
 
-func failSignalSQL(ctx context.Context, q sqlRunner, id string, owner string, attempt int, cause error) error {
+func renewSignalLeaseSQL(ctx context.Context, q sqlRunner, id string, owner string, attempt int, lease time.Duration) error {
+	leaseUntil := nowUTC().Add(lease)
+	res, err := q.ExecContext(ctx,
+		`update machine_signals
+		    set lease_until = ?
+		  where id = ?
+		    and status = 'processing'
+		    and owner = ?
+		    and attempts = ?`,
+		formatTime(leaseUntil), id, owner, attempt,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := res.RowsAffected(); rows == 1 {
+		return nil
+	}
+	return resolveSignalCompleteMiss(ctx, q, id, owner, attempt, false)
+}
+
+func failEntrySQL(ctx context.Context, q sqlRunner, key EntryKey, owner string, attempt int, failure Failure) error {
 	message := ""
-	if cause != nil {
-		message = cause.Error()
+	if failure.Cause != nil {
+		message = failure.Cause.Error()
+	}
+	status := EntryFailed
+	retryAt := formatOptionalTime(failure.RetryAt)
+	if failure.DeadLetter {
+		status = EntryDeadLettered
+		retryAt = sql.NullString{}
+	}
+	res, err := q.ExecContext(ctx,
+		`update machine_entries
+		    set status = ?,
+		        owner = null,
+		        lease_until = null,
+		        retry_at = ?,
+		        last_error = ?
+		  where machine_id = ?
+		    and version = ?
+		    and status = 'processing'
+		    and owner = ?
+		    and attempts = ?`,
+		status, retryAt, message, key.MachineID, key.Version, owner, attempt,
+	)
+	if err != nil {
+		return err
+	}
+	if rows, _ := res.RowsAffected(); rows == 1 {
+		return nil
+	}
+	return resolveEntryCompleteMiss(ctx, q, key, owner, attempt, false)
+}
+
+func failSignalSQL(ctx context.Context, q sqlRunner, id string, owner string, attempt int, failure Failure) error {
+	message := ""
+	if failure.Cause != nil {
+		message = failure.Cause.Error()
+	}
+	status := EntryFailed
+	retryAt := formatOptionalTime(failure.RetryAt)
+	if failure.DeadLetter {
+		status = EntryDeadLettered
+		retryAt = sql.NullString{}
 	}
 	res, err := q.ExecContext(ctx,
 		`update machine_signals
-		    set status = 'failed',
+		    set status = ?,
 		        owner = null,
 		        lease_until = null,
+		        retry_at = ?,
 		        last_error = ?
 		  where id = ?
 		    and status = 'processing'
 		    and owner = ?
 		    and attempts = ?`,
-		message, id, owner, attempt,
+		status, retryAt, message, id, owner, attempt,
 	)
 	if err != nil {
 		return err
@@ -825,6 +950,9 @@ func resolveEntryCompleteMiss(ctx context.Context, q sqlRunner, key EntryKey, re
 	if status == EntryDone && allowDone && owner == requestedOwner && attempt == requestedAttempt {
 		return nil
 	}
+	if status == EntryDeadLettered {
+		return ErrWorkDeadLettered
+	}
 	return ErrEntryNotOwned
 }
 
@@ -843,6 +971,9 @@ func resolveSignalCompleteMiss(ctx context.Context, q sqlRunner, id string, requ
 	}
 	if status == EntryDone && allowDone && owner == requestedOwner && attempt == requestedAttempt {
 		return nil
+	}
+	if status == EntryDeadLettered {
+		return ErrWorkDeadLettered
 	}
 	return ErrSignalNotOwned
 }

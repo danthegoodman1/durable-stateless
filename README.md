@@ -117,6 +117,45 @@ after side effect, before done mark   -> same entry key is retried
 handler returns next trigger/signals  -> done mark + outputs commit atomically
 ```
 
+## Retries And Leases
+
+Failed entries and signals are not retried in a tight loop. The runtime turns a
+failure into durable retry metadata:
+
+```go
+rt := durablestateless.NewRuntime(
+	provider,
+	OrderMachine{},
+	durablestateless.WithRetryPolicy(durablestateless.RetryPolicy{
+		MaxAttempts:    10,
+		InitialBackoff: time.Second,
+		MaxBackoff:     time.Minute,
+		Multiplier:     2,
+	}),
+)
+```
+
+`MaxAttempts` is checked against the claimed attempt number. When it is
+exhausted, the row becomes `dead_lettered` and is no longer claimable. A
+dead-lettered entry still blocks the machine version it belongs to; that is
+intentional, because the state-entry work never completed safely.
+
+Workers also renew entry-handler leases while the handler is running:
+
+```go
+rt := durablestateless.NewRuntime(
+	provider,
+	OrderMachine{},
+	durablestateless.WithLeaseDuration(30*time.Second),
+	durablestateless.WithLeaseRenewalInterval(10*time.Second),
+)
+```
+
+If `WithLeaseRenewalInterval` is omitted, the worker derives an interval from
+the lease duration. A negative renewal interval disables automatic renewal.
+Signal processing is expected to be short; automatic renewal is for entry
+handlers.
+
 ## Next Vs Signals
 
 Entry handlers can return two kinds of durable outputs:
@@ -282,6 +321,10 @@ plus projection.
 Completion and failure use the claim's `(owner, attempt)` pair, not just owner,
 so a stale process cannot finish work after the same worker ID has reclaimed an
 expired lease.
+
+Failed rows carry a `retry_at` timestamp. Providers should only claim failed
+rows after that time, and should never claim `dead_lettered` rows. Lease renewal
+must also be guarded by `(owner, attempt)`.
 
 ## Current Scope
 

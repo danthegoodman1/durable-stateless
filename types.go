@@ -24,6 +24,7 @@ var (
 	ErrSignalConflict    = errors.New("durablestateless: signal id conflicts with existing signal")
 	ErrSignalNotFound    = errors.New("durablestateless: signal not found")
 	ErrSignalNotOwned    = errors.New("durablestateless: signal is not processing for owner")
+	ErrWorkDeadLettered  = errors.New("durablestateless: work is dead-lettered")
 	ErrVersionConflict   = errors.New("durablestateless: machine version conflict")
 	ErrTerminalMachine   = errors.New("durablestateless: machine is terminal")
 	ErrWrongShard        = errors.New("durablestateless: worker does not own machine shard")
@@ -43,9 +44,42 @@ const (
 	EntryProcessing EntryStatus = "processing"
 	// EntryDone means work completed successfully.
 	EntryDone EntryStatus = "done"
-	// EntryFailed means a prior attempt failed and the work can be reclaimed.
+	// EntryFailed means a prior attempt failed and the work can be reclaimed
+	// after RetryAt, if any.
 	EntryFailed EntryStatus = "failed"
+	// EntryDeadLettered means work exhausted its retry policy and is no longer
+	// claimable.
+	EntryDeadLettered EntryStatus = "dead_lettered"
 )
+
+// DefaultRetryPolicy returns the retry policy used by NewRuntime unless
+// overridden. The first failure waits one second, then backs off exponentially
+// up to one minute, and the tenth failed attempt dead-letters the work.
+func DefaultRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts:    10,
+		InitialBackoff: time.Second,
+		MaxBackoff:     time.Minute,
+		Multiplier:     2,
+	}
+}
+
+// RetryPolicy controls how failed entries and signals are retried. MaxAttempts
+// is compared with the current claimed attempt; a value <= 0 means unlimited
+// attempts. InitialBackoff <= 0 makes retries immediately claimable.
+type RetryPolicy struct {
+	MaxAttempts    int
+	InitialBackoff time.Duration
+	MaxBackoff     time.Duration
+	Multiplier     float64
+}
+
+// Failure is the provider-facing result of a failed work attempt.
+type Failure struct {
+	Cause      error
+	RetryAt    *time.Time
+	DeadLetter bool
+}
 
 // EntryKey is the idempotency key for a state-entry handler. A machine creates
 // at most one entry for each committed version.
@@ -105,6 +139,7 @@ type Entry struct {
 	Status      EntryStatus
 	Owner       string
 	LeaseUntil  *time.Time
+	RetryAt     *time.Time
 	Attempts    int
 	CreatedAt   time.Time
 	StartedAt   *time.Time
@@ -166,6 +201,7 @@ type SignalRecord struct {
 	Status        EntryStatus
 	Owner         string
 	LeaseUntil    *time.Time
+	RetryAt       *time.Time
 	Attempts      int
 	CreatedAt     time.Time
 	StartedAt     *time.Time
@@ -200,15 +236,29 @@ type CommitResult struct {
 // Provider is the storage contract for durable machines, signals, entry work,
 // leases, and atomic commits.
 type Provider interface {
+	// Migrate prepares provider storage.
 	Migrate(ctx context.Context) error
+	// CreateMachine inserts a new durable machine.
 	CreateMachine(ctx context.Context, record MachineRecord) error
+	// ReadMachine returns the current durable machine snapshot.
 	ReadMachine(ctx context.Context, id string) (*Snapshot, error)
+	// EnqueueSignal durably inserts a signal, deduplicated by signal ID.
 	EnqueueSignal(ctx context.Context, signal SignalRecord) error
+	// ClaimSignals leases claimable signals for owned shards.
 	ClaimSignals(ctx context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]SignalRecord, error)
+	// ClaimEntries leases claimable entry work for owned shards.
 	ClaimEntries(ctx context.Context, owner string, shards []ShardID, limit int, lease time.Duration) ([]Entry, error)
+	// RenewSignalLease extends a signal lease for the current claim token.
+	RenewSignalLease(ctx context.Context, id string, owner string, attempt int, lease time.Duration) error
+	// RenewEntryLease extends an entry lease for the current claim token.
+	RenewEntryLease(ctx context.Context, key EntryKey, owner string, attempt int, lease time.Duration) error
+	// Commit applies all requested completion, transition, and signal changes
+	// atomically.
 	Commit(ctx context.Context, cmd AtomicCommit) (*CommitResult, error)
-	FailEntry(ctx context.Context, key EntryKey, owner string, attempt int, cause error) error
-	FailSignal(ctx context.Context, id string, owner string, attempt int, cause error) error
+	// FailEntry records a failed entry attempt using the supplied retry decision.
+	FailEntry(ctx context.Context, key EntryKey, owner string, attempt int, failure Failure) error
+	// FailSignal records a failed signal attempt using the supplied retry decision.
+	FailSignal(ctx context.Context, id string, owner string, attempt int, failure Failure) error
 }
 
 // Definition describes a durable state machine. Configure should define

@@ -29,22 +29,42 @@ func WithLeaseDuration(lease time.Duration) Option {
 	}
 }
 
+// WithLeaseRenewalInterval configures how often workers renew entry-handler
+// leases. A zero interval derives from the lease duration; a negative interval
+// disables automatic renewal.
+func WithLeaseRenewalInterval(interval time.Duration) Option {
+	return func(r *Runtime) {
+		r.renewInterval = interval
+	}
+}
+
+// WithRetryPolicy configures failure backoff and dead-lettering for entries and
+// signals processed by this runtime.
+func WithRetryPolicy(policy RetryPolicy) Option {
+	return func(r *Runtime) {
+		r.retryPolicy = policy
+	}
+}
+
 // Runtime evaluates stateless rules, resolves machine shards, and coordinates
 // durable signals and worker processing through a Provider.
 type Runtime struct {
-	provider Provider
-	def      Definition
-	sharder  Sharder
-	lease    time.Duration
+	provider      Provider
+	def           Definition
+	sharder       Sharder
+	lease         time.Duration
+	renewInterval time.Duration
+	retryPolicy   RetryPolicy
 }
 
 // NewRuntime creates a Runtime. By default all machines are placed on shard 0.
 func NewRuntime(provider Provider, def Definition, options ...Option) *Runtime {
 	r := &Runtime{
-		provider: provider,
-		def:      def,
-		sharder:  MustHashSharder(1),
-		lease:    DefaultLeaseDuration,
+		provider:    provider,
+		def:         def,
+		sharder:     MustHashSharder(1),
+		lease:       DefaultLeaseDuration,
+		retryPolicy: DefaultRetryPolicy(),
 	}
 	for _, option := range options {
 		option(r)
@@ -106,11 +126,19 @@ func (r *Runtime) Worker(config WorkerConfig) *Worker {
 	if lease == 0 {
 		lease = DefaultLeaseDuration
 	}
+	renewInterval := r.renewInterval
+	if renewInterval == 0 && lease > 0 {
+		renewInterval = lease / 3
+		if renewInterval <= 0 {
+			renewInterval = lease
+		}
+	}
 	return &Worker{
-		runtime: r,
-		id:      config.ID,
-		shards:  cloneShards(config.Shards),
-		lease:   lease,
+		runtime:       r,
+		id:            config.ID,
+		shards:        cloneShards(config.Shards),
+		lease:         lease,
+		renewInterval: renewInterval,
 	}
 }
 
@@ -245,10 +273,11 @@ type WorkerConfig struct {
 
 // Worker claims and processes durable signals and entry work for owned shards.
 type Worker struct {
-	runtime *Runtime
-	id      string
-	shards  []ShardID
-	lease   time.Duration
+	runtime       *Runtime
+	id            string
+	shards        []ShardID
+	lease         time.Duration
+	renewInterval time.Duration
 }
 
 // Work processes up to limit successful units of work for the worker's shards.
@@ -331,12 +360,12 @@ func (w *Worker) processSignal(ctx context.Context, signal SignalRecord) error {
 
 	snap, err := w.runtime.provider.ReadMachine(ctx, signal.MachineID)
 	if err != nil {
-		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, err)
+		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, w.runtime.failure(signal.Attempts, err))
 		return err
 	}
 	if !w.owns(snap.ShardID) {
 		err := fmt.Errorf("%w: machine %s is on shard %d", ErrWrongShard, snap.ID, snap.ShardID)
-		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, err)
+		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, w.runtime.failure(signal.Attempts, err))
 		return err
 	}
 
@@ -349,7 +378,7 @@ func (w *Worker) processSignal(ctx context.Context, signal SignalRecord) error {
 	}
 	cmd, err := w.runtime.buildCommit(ctx, snap, signal.Trigger, signal.Args...)
 	if err != nil {
-		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, err)
+		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, w.runtime.failure(signal.Attempts, err))
 		return err
 	}
 	if cmd != nil {
@@ -359,7 +388,7 @@ func (w *Worker) processSignal(ctx context.Context, signal SignalRecord) error {
 	_, err = w.runtime.provider.Commit(ctx, commit)
 	if err != nil {
 		if shouldFailClaimedWork(err) {
-			_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, err)
+			_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.Attempts, w.runtime.failure(signal.Attempts, err))
 		}
 		return err
 	}
@@ -375,7 +404,7 @@ func (w *Worker) processEntry(ctx context.Context, entry Entry) error {
 	}
 	if !w.owns(entry.ShardID) {
 		err := fmt.Errorf("%w: machine %s is on shard %d", ErrWrongShard, entry.Key.MachineID, entry.ShardID)
-		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, err)
+		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		return err
 	}
 
@@ -392,19 +421,24 @@ func (w *Worker) processEntry(ctx context.Context, entry Entry) error {
 	}
 	if handler == nil {
 		err := fmt.Errorf("%w for state %v", ErrNilEntryHandler, entry.DestState)
-		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, err)
+		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		return err
 	}
 
-	result, err := handler(ctx, entry)
+	handlerCtx, stopRenewal := w.renewEntryLeaseWhileProcessing(ctx, entry)
+	result, err := handler(handlerCtx, entry)
+	renewErr := stopRenewal()
+	if renewErr != nil {
+		return renewErr
+	}
 	if err != nil {
-		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, err)
+		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		return err
 	}
 
 	records, err := w.runtime.prepareSignals(ctx, result.Signals)
 	if err != nil {
-		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, err)
+		_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		return err
 	}
 
@@ -419,12 +453,12 @@ func (w *Worker) processEntry(ctx context.Context, entry Entry) error {
 	if result.Next != nil {
 		snap, err := w.runtime.provider.ReadMachine(ctx, entry.Key.MachineID)
 		if err != nil {
-			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, err)
+			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 			return err
 		}
 		cmd, err := w.runtime.buildCommit(ctx, snap, result.Next.Trigger, result.Next.Args...)
 		if err != nil {
-			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, err)
+			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 			return err
 		}
 		commit.Transition = cmd
@@ -433,11 +467,54 @@ func (w *Worker) processEntry(ctx context.Context, entry Entry) error {
 	_, err = w.runtime.provider.Commit(ctx, commit)
 	if err != nil {
 		if shouldFailClaimedWork(err) {
-			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, err)
+			_ = w.runtime.provider.FailEntry(ctx, entry.Key, entry.Owner, entry.Attempts, w.runtime.failure(entry.Attempts, err))
 		}
 		return err
 	}
 	return nil
+}
+
+func (w *Worker) renewEntryLeaseWhileProcessing(ctx context.Context, entry Entry) (context.Context, func() error) {
+	if w.lease <= 0 || w.renewInterval <= 0 {
+		return ctx, func() error { return nil }
+	}
+
+	handlerCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+
+	go func() {
+		ticker := time.NewTicker(w.renewInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-handlerCtx.Done():
+				return
+			case <-ticker.C:
+				if err := w.runtime.provider.RenewEntryLease(ctx, entry.Key, entry.Owner, entry.Attempts, w.lease); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	return handlerCtx, func() error {
+		close(done)
+		cancel()
+		select {
+		case err := <-errCh:
+			return err
+		default:
+			return nil
+		}
+	}
 }
 
 func (w *Worker) owns(shard ShardID) bool {
@@ -470,6 +547,46 @@ func (w *Worker) validate() error {
 
 func shouldFailClaimedWork(err error) bool {
 	return !errors.Is(err, ErrEntryInProgress) && !errors.Is(err, ErrVersionConflict)
+}
+
+func (r *Runtime) failure(attempt int, cause error) Failure {
+	policy := r.retryPolicy
+	failure := Failure{Cause: cause}
+	if policy.MaxAttempts > 0 && attempt >= policy.MaxAttempts {
+		failure.DeadLetter = true
+		return failure
+	}
+	backoff := retryBackoff(policy, attempt)
+	if backoff > 0 {
+		retryAt := nowUTC().Add(backoff)
+		failure.RetryAt = &retryAt
+	}
+	return failure
+}
+
+func retryBackoff(policy RetryPolicy, attempt int) time.Duration {
+	if policy.InitialBackoff <= 0 {
+		return 0
+	}
+	backoff := policy.InitialBackoff
+	multiplier := policy.Multiplier
+	if multiplier < 1 {
+		multiplier = 1
+	}
+	for i := 1; i < attempt; i++ {
+		next := time.Duration(float64(backoff) * multiplier)
+		if next <= backoff {
+			break
+		}
+		backoff = next
+		if policy.MaxBackoff > 0 && backoff >= policy.MaxBackoff {
+			return policy.MaxBackoff
+		}
+	}
+	if policy.MaxBackoff > 0 && backoff > policy.MaxBackoff {
+		return policy.MaxBackoff
+	}
+	return backoff
 }
 
 func cloneShards(shards []ShardID) []ShardID {

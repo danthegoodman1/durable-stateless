@@ -112,7 +112,7 @@ func (p *MemoryProvider) ClaimSignals(_ context.Context, owner string, shards []
 		if _, ok := shardSet[signal.TargetShardID]; !ok {
 			continue
 		}
-		if claimable(signal.Status, signal.LeaseUntil, now) {
+		if claimable(signal.Status, signal.LeaseUntil, signal.RetryAt, now) {
 			ids = append(ids, id)
 		}
 	}
@@ -135,6 +135,7 @@ func (p *MemoryProvider) ClaimSignals(_ context.Context, owner string, shards []
 		signal.Status = EntryProcessing
 		signal.Owner = owner
 		signal.LeaseUntil = &leaseUntil
+		signal.RetryAt = nil
 		signal.Attempts++
 		signal.StartedAt = &now
 		claimed = append(claimed, *cloneSignalRecord(signal))
@@ -174,7 +175,7 @@ func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []
 		if _, ok := shardSet[machine.ShardID]; !ok {
 			continue
 		}
-		if claimable(entry.Status, entry.LeaseUntil, now) {
+		if claimable(entry.Status, entry.LeaseUntil, entry.RetryAt, now) {
 			keys = append(keys, key)
 		}
 	}
@@ -200,6 +201,7 @@ func (p *MemoryProvider) ClaimEntries(_ context.Context, owner string, shards []
 		entry.Status = EntryProcessing
 		entry.Owner = owner
 		entry.LeaseUntil = &leaseUntil
+		entry.RetryAt = nil
 		entry.Attempts++
 		entry.StartedAt = &now
 		claimed = append(claimed, *cloneEntry(entry))
@@ -252,16 +254,28 @@ func (p *MemoryProvider) Commit(_ context.Context, cmd AtomicCommit) (*CommitRes
 	}, nil
 }
 
-func (p *MemoryProvider) FailEntry(_ context.Context, key EntryKey, owner string, attempt int, cause error) error {
+func (p *MemoryProvider) RenewSignalLease(_ context.Context, id string, owner string, attempt int, lease time.Duration) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return failEntry(p.entries, key, owner, attempt, cause)
+	return renewSignalLease(p.signals, id, owner, attempt, lease)
 }
 
-func (p *MemoryProvider) FailSignal(_ context.Context, id string, owner string, attempt int, cause error) error {
+func (p *MemoryProvider) RenewEntryLease(_ context.Context, key EntryKey, owner string, attempt int, lease time.Duration) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return failSignal(p.signals, id, owner, attempt, cause)
+	return renewEntryLease(p.entries, key, owner, attempt, lease)
+}
+
+func (p *MemoryProvider) FailEntry(_ context.Context, key EntryKey, owner string, attempt int, failure Failure) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return failEntry(p.entries, key, owner, attempt, failure)
+}
+
+func (p *MemoryProvider) FailSignal(_ context.Context, id string, owner string, attempt int, failure Failure) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return failSignal(p.signals, id, owner, attempt, failure)
 }
 
 func commitTransition(machines map[string]*Snapshot, entries map[EntryKey]*Entry, cmd CommitTransition) (*Snapshot, *Entry, error) {
@@ -347,6 +361,7 @@ func enqueueSignal(signals map[string]*SignalRecord, signal SignalRecord) error 
 	next.Status = EntryPending
 	next.Owner = ""
 	next.LeaseUntil = nil
+	next.RetryAt = nil
 	next.StartedAt = nil
 	next.CompletedAt = nil
 	next.LastError = ""
@@ -393,10 +408,12 @@ func validateRecordSymbols(record TransitionRecord) (string, string, string, err
 	return source, dest, trigger, nil
 }
 
-func claimable(status EntryStatus, leaseUntil *time.Time, now time.Time) bool {
+func claimable(status EntryStatus, leaseUntil *time.Time, retryAt *time.Time, now time.Time) bool {
 	switch status {
-	case EntryPending, EntryFailed:
+	case EntryPending:
 		return true
+	case EntryFailed:
+		return retryAt == nil || !retryAt.After(now)
 	case EntryProcessing:
 		return leaseUntil == nil || leaseUntil.Before(now)
 	default:
@@ -415,12 +432,16 @@ func completeEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, atte
 		}
 		return ErrEntryNotOwned
 	}
+	if entry.Status == EntryDeadLettered {
+		return ErrWorkDeadLettered
+	}
 	if entry.Status != EntryProcessing || entry.Owner != owner || entry.Attempts != attempt {
 		return ErrEntryNotOwned
 	}
 	now := nowUTC()
 	entry.Status = EntryDone
 	entry.LeaseUntil = nil
+	entry.RetryAt = nil
 	entry.CompletedAt = &now
 	return nil
 }
@@ -436,46 +457,100 @@ func completeSignal(signals map[string]*SignalRecord, id string, owner string, a
 		}
 		return ErrSignalNotOwned
 	}
+	if signal.Status == EntryDeadLettered {
+		return ErrWorkDeadLettered
+	}
 	if signal.Status != EntryProcessing || signal.Owner != owner || signal.Attempts != attempt {
 		return ErrSignalNotOwned
 	}
 	now := nowUTC()
 	signal.Status = EntryDone
 	signal.LeaseUntil = nil
+	signal.RetryAt = nil
 	signal.CompletedAt = &now
 	return nil
 }
 
-func failEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt int, cause error) error {
+func renewEntryLease(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt int, lease time.Duration) error {
 	entry := entries[key]
 	if entry == nil {
 		return ErrEntryNotFound
 	}
 	if entry.Status != EntryProcessing || entry.Owner != owner || entry.Attempts != attempt {
+		if entry.Status == EntryDeadLettered {
+			return ErrWorkDeadLettered
+		}
 		return ErrEntryNotOwned
 	}
-	entry.Status = EntryFailed
-	entry.Owner = ""
-	entry.LeaseUntil = nil
-	if cause != nil {
-		entry.LastError = cause.Error()
-	}
+	leaseUntil := nowUTC().Add(lease)
+	entry.LeaseUntil = &leaseUntil
 	return nil
 }
 
-func failSignal(signals map[string]*SignalRecord, id string, owner string, attempt int, cause error) error {
+func renewSignalLease(signals map[string]*SignalRecord, id string, owner string, attempt int, lease time.Duration) error {
 	signal := signals[id]
 	if signal == nil {
 		return ErrSignalNotFound
 	}
 	if signal.Status != EntryProcessing || signal.Owner != owner || signal.Attempts != attempt {
+		if signal.Status == EntryDeadLettered {
+			return ErrWorkDeadLettered
+		}
 		return ErrSignalNotOwned
 	}
-	signal.Status = EntryFailed
+	leaseUntil := nowUTC().Add(lease)
+	signal.LeaseUntil = &leaseUntil
+	return nil
+}
+
+func failEntry(entries map[EntryKey]*Entry, key EntryKey, owner string, attempt int, failure Failure) error {
+	entry := entries[key]
+	if entry == nil {
+		return ErrEntryNotFound
+	}
+	if entry.Status != EntryProcessing || entry.Owner != owner || entry.Attempts != attempt {
+		if entry.Status == EntryDeadLettered {
+			return ErrWorkDeadLettered
+		}
+		return ErrEntryNotOwned
+	}
+	if failure.DeadLetter {
+		entry.Status = EntryDeadLettered
+		entry.RetryAt = nil
+	} else {
+		entry.Status = EntryFailed
+		entry.RetryAt = cloneTime(failure.RetryAt)
+	}
+	entry.Owner = ""
+	entry.LeaseUntil = nil
+	if failure.Cause != nil {
+		entry.LastError = failure.Cause.Error()
+	}
+	return nil
+}
+
+func failSignal(signals map[string]*SignalRecord, id string, owner string, attempt int, failure Failure) error {
+	signal := signals[id]
+	if signal == nil {
+		return ErrSignalNotFound
+	}
+	if signal.Status != EntryProcessing || signal.Owner != owner || signal.Attempts != attempt {
+		if signal.Status == EntryDeadLettered {
+			return ErrWorkDeadLettered
+		}
+		return ErrSignalNotOwned
+	}
+	if failure.DeadLetter {
+		signal.Status = EntryDeadLettered
+		signal.RetryAt = nil
+	} else {
+		signal.Status = EntryFailed
+		signal.RetryAt = cloneTime(failure.RetryAt)
+	}
 	signal.Owner = ""
 	signal.LeaseUntil = nil
-	if cause != nil {
-		signal.LastError = cause.Error()
+	if failure.Cause != nil {
+		signal.LastError = failure.Cause.Error()
 	}
 	return nil
 }
@@ -533,6 +608,7 @@ func cloneEntry(entry *Entry) *Entry {
 		Status:      entry.Status,
 		Owner:       entry.Owner,
 		LeaseUntil:  cloneTime(entry.LeaseUntil),
+		RetryAt:     cloneTime(entry.RetryAt),
 		Attempts:    entry.Attempts,
 		CreatedAt:   entry.CreatedAt,
 		StartedAt:   cloneTime(entry.StartedAt),
@@ -556,6 +632,7 @@ func cloneSignalRecord(signal *SignalRecord) *SignalRecord {
 		Status:        signal.Status,
 		Owner:         signal.Owner,
 		LeaseUntil:    cloneTime(signal.LeaseUntil),
+		RetryAt:       cloneTime(signal.RetryAt),
 		Attempts:      signal.Attempts,
 		CreatedAt:     signal.CreatedAt,
 		StartedAt:     cloneTime(signal.StartedAt),
