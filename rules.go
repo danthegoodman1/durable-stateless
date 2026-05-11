@@ -1,6 +1,7 @@
 package durablestateless
 
 import (
+	"context"
 	"reflect"
 
 	"github.com/qmuntal/stateless"
@@ -18,12 +19,12 @@ func newRules(sm *stateless.StateMachine) *Rules {
 
 // Configure starts configuring transitions for state.
 func (r *Rules) Configure(state stateless.State) *StateRules {
-	return &StateRules{config: r.sm.Configure(state)}
+	return &StateRules{config: r.sm.Configure(mustSymbol("state", state))}
 }
 
 // SetTriggerParameters declares the expected argument types for a trigger.
 func (r *Rules) SetTriggerParameters(trigger stateless.Trigger, argumentTypes ...reflect.Type) {
-	r.sm.SetTriggerParameters(trigger, argumentTypes...)
+	r.sm.SetTriggerParameters(mustSymbol("trigger", trigger), argumentTypes...)
 }
 
 // OnUnhandledTrigger configures stateless behavior for unhandled triggers.
@@ -43,30 +44,44 @@ func (r *StateRules) State() stateless.State {
 
 // Permit allows trigger to transition to destinationState.
 func (r *StateRules) Permit(trigger stateless.Trigger, destinationState stateless.State, guards ...stateless.GuardFunc) *StateRules {
-	r.config.Permit(trigger, destinationState, guards...)
+	r.config.Permit(mustSymbol("trigger", trigger), mustSymbol("destination state", destinationState), guards...)
 	return r
 }
 
 // PermitDynamic allows trigger to choose a destination with selector.
 func (r *StateRules) PermitDynamic(trigger stateless.Trigger, selector stateless.DestinationSelectorFunc, guards ...stateless.GuardFunc) *StateRules {
-	r.config.PermitDynamic(trigger, selector, guards...)
+	r.config.PermitDynamic(mustSymbol("trigger", trigger), func(ctx context.Context, args ...any) (stateless.State, error) {
+		state, err := selector(ctx, args...)
+		if err != nil {
+			return nil, err
+		}
+		return mustSymbol("destination state", state), nil
+	}, guards...)
 	return r
 }
 
 // PermitReentry allows trigger to re-enter the current state.
 func (r *StateRules) PermitReentry(trigger stateless.Trigger, guards ...stateless.GuardFunc) *StateRules {
-	r.config.PermitReentry(trigger, guards...)
+	r.config.PermitReentry(mustSymbol("trigger", trigger), guards...)
 	return r
 }
 
 // Ignore treats trigger as a legal no-op.
 func (r *StateRules) Ignore(trigger stateless.Trigger, guards ...stateless.GuardFunc) *StateRules {
-	r.config.Ignore(trigger, guards...)
+	r.config.Ignore(mustSymbol("trigger", trigger), guards...)
 	return r
 }
 
 // SubstateOf marks this state as a substate of superstate.
 func (r *StateRules) SubstateOf(superstate stateless.State) *StateRules {
-	r.config.SubstateOf(superstate)
+	r.config.SubstateOf(mustSymbol("superstate", superstate))
 	return r
+}
+
+func mustSymbol(kind string, value any) string {
+	symbol, err := encodeSymbol(kind, value)
+	if err != nil {
+		panic(err)
+	}
+	return symbol
 }

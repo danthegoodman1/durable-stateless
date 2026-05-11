@@ -93,6 +93,9 @@ func (p *MemoryProvider) AcquireShardLeases(_ context.Context, owner string, sha
 	if owner == "" {
 		return nil, fmt.Errorf("durablestateless: owner is required")
 	}
+	if err := validateLeaseDuration(lease); err != nil {
+		return nil, err
+	}
 	if len(shards) == 0 {
 		return nil, nil
 	}
@@ -113,10 +116,7 @@ func (p *MemoryProvider) AcquireShardLeases(_ context.Context, owner string, sha
 		}
 		epoch := int64(1)
 		if current != nil {
-			epoch = current.Epoch
-			if current.Owner != owner || !current.LeaseUntil.After(now) {
-				epoch++
-			}
+			epoch = current.Epoch + 1
 		}
 		next := &ShardLease{
 			ShardID:    shard,
@@ -134,6 +134,9 @@ func (p *MemoryProvider) AcquireShardLeases(_ context.Context, owner string, sha
 func (p *MemoryProvider) RenewShardLeases(_ context.Context, owner string, leases []ShardLease, lease time.Duration) ([]ShardLease, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("durablestateless: owner is required")
+	}
+	if err := validateLeaseDuration(lease); err != nil {
+		return nil, err
 	}
 	if len(leases) == 0 {
 		return nil, nil
@@ -637,6 +640,13 @@ func shardLeaseOwned(shardLeases map[ShardID]*ShardLease, shard ShardID, owner s
 		lease.Owner == owner &&
 		lease.Epoch == ownerEpoch &&
 		lease.LeaseUntil.After(now)
+}
+
+func validateLeaseDuration(lease time.Duration) error {
+	if lease <= 0 {
+		return ErrInvalidLease
+	}
+	return nil
 }
 
 func cloneSnapshots(in map[string]*Snapshot) map[string]*Snapshot {

@@ -105,6 +105,12 @@ provider acquires shard leases for [3, 7]
 provider claims signals and entries only for those live lease epochs
 ```
 
+`WorkerConfig.ID` identifies the active worker instance for lease fencing. If
+the same owner reacquires a shard, the provider advances the shard lease epoch;
+old claims from that owner can no longer complete. Do not run `Work`
+concurrently for the same worker instance. Shard lists must not contain
+duplicates.
+
 Shard assignment is a runtime concern. By default all machines live on shard
 zero; pass `WithSharder(MustHashSharder(n))` to place machines by
 `hash(machine_id) % n`. A provider persists the shard chosen by the runtime and
@@ -119,6 +125,9 @@ during handler                        -> shard lease expires; entry is retried
 after side effect, before done mark   -> same entry key is retried
 handler returns next trigger/signals  -> done mark + outputs commit atomically
 ```
+
+A signal delivered after its target machine is terminal is completed as a no-op.
+That keeps obsolete messages from retrying forever.
 
 ## Retries And Leases
 
@@ -156,6 +165,8 @@ rt := durablestateless.NewRuntime(
 
 If `WithLeaseRenewalInterval` is omitted, the worker derives an interval from
 the lease duration. A negative renewal interval disables automatic renewal.
+Provider implementations reject non-positive shard lease durations; the runtime
+uses `DefaultLeaseDuration` when no positive duration is configured.
 
 Leases are per shard, not per entry or signal. Claimed rows record the shard
 lease epoch that owned them. Completion and failure are fenced by
@@ -337,13 +348,15 @@ has reacquired the shard with a newer epoch.
 
 Failed rows carry a `retry_at` timestamp. Providers should only claim failed
 rows after that time, and should never claim `dead_lettered` rows. Shard lease
-renewal must be guarded by `(owner, epoch)`.
+renewal must be guarded by `(owner, epoch)`. Reacquiring a shard for the same
+owner should create a newer epoch rather than sharing the existing claim token.
 
 ## Current Scope
 
 This is still a PoC.
 
-- states and triggers must be strings or string aliases
+- states and triggers must be strings or string aliases; aliases are
+  canonicalized to their string value by `Rules`
 - args must be JSON-compatible
 - SQLite uses `github.com/mattn/go-sqlite3`, so CGO is required
 - shard ownership is enforced by worker claims; public callers send signals

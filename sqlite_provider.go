@@ -173,6 +173,9 @@ func (p *SQLiteProvider) AcquireShardLeases(ctx context.Context, owner string, s
 	if owner == "" {
 		return nil, fmt.Errorf("durablestateless: owner is required")
 	}
+	if err := validateLeaseDuration(lease); err != nil {
+		return nil, err
+	}
 	if len(shards) == 0 {
 		return nil, nil
 	}
@@ -206,10 +209,7 @@ func (p *SQLiteProvider) AcquireShardLeases(ctx context.Context, owner string, s
 
 		epoch := int64(1)
 		if current != nil {
-			epoch = current.Epoch
-			if current.Owner != owner || !current.LeaseUntil.After(now) {
-				epoch++
-			}
+			epoch = current.Epoch + 1
 			_, err = conn.ExecContext(ctx,
 				`update shard_leases
 				    set owner = ?,
@@ -248,6 +248,9 @@ func (p *SQLiteProvider) AcquireShardLeases(ctx context.Context, owner string, s
 func (p *SQLiteProvider) RenewShardLeases(ctx context.Context, owner string, leases []ShardLease, lease time.Duration) ([]ShardLease, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("durablestateless: owner is required")
+	}
+	if err := validateLeaseDuration(lease); err != nil {
+		return nil, err
 	}
 	if len(leases) == 0 {
 		return nil, nil
@@ -332,12 +335,18 @@ func (p *SQLiteProvider) ClaimSignals(ctx context.Context, leases []ShardLease, 
 	}
 
 	placeholders, args := placeholdersForLeaseSet(leaseSet)
+	args = append(args, formatTime(now), formatTime(now), limit)
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
-		`select id
-		   from machine_signals
-		  where target_shard_id in (%s)
-		    and status in ('pending', 'failed', 'processing')
-		  order by created_at, id`, strings.Join(placeholders, ",")), args...)
+		`select s.id
+		   from machine_signals s
+		   join shard_leases l on l.shard_id = s.target_shard_id
+		  where s.target_shard_id in (%s)
+		    and l.lease_until > ?
+		    and (s.status = 'pending'
+		      or (s.status = 'failed' and (s.retry_at is null or s.retry_at <= ?))
+		      or (s.status = 'processing' and (coalesce(s.owner, '') != l.owner or s.owner_epoch != l.epoch)))
+		  order by s.created_at, s.id
+		  limit ?`, strings.Join(placeholders, ",")), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -438,15 +447,21 @@ func (p *SQLiteProvider) ClaimEntries(ctx context.Context, leases []ShardLease, 
 	}
 
 	placeholders, args := placeholdersForLeaseSet(leaseSet)
+	args = append(args, formatTime(now), formatTime(now), limit)
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(
 		`select e.machine_id, e.version
 		   from machine_entries e
 		   join machines m on m.id = e.machine_id
+		   join shard_leases l on l.shard_id = m.shard_id
 		  where m.shard_id in (%s)
 		    and m.terminal_at is null
 		    and e.version = m.version
-		    and e.status in ('pending', 'failed', 'processing')
-		  order by e.created_at, e.machine_id, e.version`, strings.Join(placeholders, ",")), args...)
+		    and l.lease_until > ?
+		    and (e.status = 'pending'
+		      or (e.status = 'failed' and (e.retry_at is null or e.retry_at <= ?))
+		      or (e.status = 'processing' and (coalesce(e.owner, '') != l.owner or e.owner_epoch != l.epoch)))
+		  order by e.created_at, e.machine_id, e.version
+		  limit ?`, strings.Join(placeholders, ",")), args...)
 	if err != nil {
 		return nil, err
 	}

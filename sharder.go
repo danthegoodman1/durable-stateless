@@ -50,10 +50,15 @@ func validateShardID(shard ShardID) error {
 }
 
 func validateShardIDs(shards []ShardID) error {
+	seen := make(map[ShardID]struct{}, len(shards))
 	for _, shard := range shards {
 		if err := validateShardID(shard); err != nil {
 			return err
 		}
+		if _, ok := seen[shard]; ok {
+			return ErrInvalidShard
+		}
+		seen[shard] = struct{}{}
 	}
 	return nil
 }

@@ -284,7 +284,8 @@ type Worker struct {
 // Work processes up to limit successful units of work for the worker's shards.
 // A unit is either a completed signal or a completed entry handler. Work first
 // acquires shard leases, renews them while it runs, recovers unfinished entries,
-// applies signals, then processes entries created by those signals.
+// applies signals, then processes entries created by those signals. Do not call
+// Work concurrently on the same Worker.
 func (w *Worker) Work(ctx context.Context, limit int) (int, error) {
 	if err := w.validate(); err != nil {
 		return 0, err
@@ -393,6 +394,11 @@ func (w *Worker) processSignal(ctx context.Context, signal SignalRecord) error {
 			Attempt:    signal.Attempts,
 		},
 	}
+	if snap.Terminal() {
+		_, err = w.runtime.provider.Commit(ctx, commit)
+		return err
+	}
+
 	cmd, err := w.runtime.buildCommit(ctx, snap, signal.Trigger, signal.Args...)
 	if err != nil {
 		_ = w.runtime.provider.FailSignal(ctx, signal.ID, signal.Owner, signal.OwnerEpoch, signal.Attempts, w.runtime.failure(signal.Attempts, err))

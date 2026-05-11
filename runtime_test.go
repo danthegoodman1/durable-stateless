@@ -78,6 +78,9 @@ func (d customDefinition) EntryHandler(state stateless.State) (EntryHandler, boo
 	return d.handler(state)
 }
 
+type aliasState string
+type aliasTrigger string
+
 type providerCase struct {
 	name string
 	new  func(*testing.T) Provider
@@ -143,6 +146,24 @@ func TestRejectsNegativeShardIDs(t *testing.T) {
 			worker := rt.Worker(WorkerConfig{ID: "worker", Shards: []ShardID{-1}})
 			if _, err := worker.Work(ctx, 1); !errors.Is(err, ErrInvalidShard) {
 				t.Fatalf("expected invalid shard on worker, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRejectsDuplicateShardIDs(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{}, WithRetryPolicy(RetryPolicy{}))
+
+			worker := rt.Worker(WorkerConfig{ID: "worker", Shards: []ShardID{1, 1}})
+			if _, err := worker.Work(ctx, 1); !errors.Is(err, ErrInvalidShard) {
+				t.Fatalf("expected duplicate shard worker to be rejected, got %v", err)
+			}
+			if _, err := provider.AcquireShardLeases(ctx, "worker", []ShardID{1, 1}, time.Second); !errors.Is(err, ErrInvalidShard) {
+				t.Fatalf("expected duplicate shard acquire to be rejected, got %v", err)
 			}
 		})
 	}
@@ -216,6 +237,35 @@ func TestSignalCommitsTransitionAndCreatesPendingEntry(t *testing.T) {
 				entry.Owner != "worker" ||
 				entry.Attempts != 1 {
 				t.Fatalf("unexpected claimed entry: %+v", entry)
+			}
+		})
+	}
+}
+
+func TestRulesCanonicalizeStringAliases(t *testing.T) {
+	const (
+		aliasIdle    aliasState   = stateIdle
+		aliasWorking aliasState   = stateWorking
+		aliasStart   aliasTrigger = triggerStart
+	)
+
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, customDefinition{
+				configure: func(rules *Rules) {
+					rules.Configure(aliasIdle).Permit(aliasStart, aliasWorking)
+				},
+			})
+			if err := rt.CreateMachineInShard(ctx, 29, MachineInit{ID: "m1", State: aliasIdle}); err != nil {
+				t.Fatalf("create alias machine: %v", err)
+			}
+
+			processSignal(t, ctx, rt, provider, "worker", 29, NewSignal("s1", "m1", aliasStart))
+			snap := readMachine(t, ctx, provider, "m1")
+			if snap.State != stateWorking || snap.Version != 1 {
+				t.Fatalf("expected alias transition to use canonical string state, got %+v", snap)
 			}
 		})
 	}
@@ -621,6 +671,59 @@ func TestShardLeaseFencesCompletionAfterExpiry(t *testing.T) {
 	}
 }
 
+func TestSameOwnerReacquireAdvancesShardLeaseEpoch(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{})
+			createMachine(t, ctx, rt, "m1", 26, stateIdle)
+
+			_, err := provider.Commit(ctx, AtomicCommit{
+				Transition: &CommitTransition{
+					MachineID:       "m1",
+					ExpectedVersion: 0,
+					Record: TransitionRecord{
+						SourceState: stateIdle,
+						DestState:   stateWorking,
+						Trigger:     triggerStart,
+						CreateEntry: true,
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("seed entry: %v", err)
+			}
+
+			firstLease := acquireShardLeases(t, ctx, provider, "worker-a", 26, time.Second)
+			claimed, err := provider.ClaimEntries(ctx, firstLease, 1)
+			if err != nil {
+				t.Fatalf("claim entry: %v", err)
+			}
+			if len(claimed) != 1 {
+				t.Fatalf("expected entry claim, got %+v", claimed)
+			}
+
+			secondLease := acquireShardLeases(t, ctx, provider, "worker-a", 26, time.Second)
+			if len(secondLease) != 1 || secondLease[0].Epoch <= firstLease[0].Epoch {
+				t.Fatalf("same owner reacquire should advance epoch, first=%+v second=%+v", firstLease, secondLease)
+			}
+
+			_, err = provider.Commit(ctx, AtomicCommit{
+				CompleteEntry: &CompleteEntryCommand{
+					Key:        claimed[0].Key,
+					Owner:      claimed[0].Owner,
+					OwnerEpoch: claimed[0].OwnerEpoch,
+					Attempt:    claimed[0].Attempts,
+				},
+			})
+			if !errors.Is(err, ErrShardLeaseLost) {
+				t.Fatalf("expected old same-owner epoch to be fenced, got %v", err)
+			}
+		})
+	}
+}
+
 func TestShardLeaseOwnershipBlocksOtherWorkersUntilExpiry(t *testing.T) {
 	for _, tc := range providerCases() {
 		t.Run(tc.name, func(t *testing.T) {
@@ -651,6 +754,60 @@ func TestShardLeaseOwnershipBlocksOtherWorkersUntilExpiry(t *testing.T) {
 			}
 			if len(leasesB) != 1 || leasesB[0].Epoch <= leasesA[0].Epoch {
 				t.Fatalf("worker-b should acquire newer epoch after expiry, first=%+v second=%+v", leasesA, leasesB)
+			}
+		})
+	}
+}
+
+func TestProviderRejectsNonPositiveShardLeaseDuration(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := tc.new(t)
+			if err := provider.Migrate(ctx); err != nil {
+				t.Fatalf("migrate provider: %v", err)
+			}
+
+			if _, err := provider.AcquireShardLeases(ctx, "worker", []ShardID{27}, 0); !errors.Is(err, ErrInvalidLease) {
+				t.Fatalf("expected invalid acquire lease, got %v", err)
+			}
+			leases, err := provider.AcquireShardLeases(ctx, "worker", []ShardID{27}, time.Second)
+			if err != nil {
+				t.Fatalf("acquire valid lease: %v", err)
+			}
+			if _, err := provider.RenewShardLeases(ctx, "worker", leases, 0); !errors.Is(err, ErrInvalidLease) {
+				t.Fatalf("expected invalid renew lease, got %v", err)
+			}
+		})
+	}
+}
+
+func TestSignalToTerminalMachineCompletesAsNoop(t *testing.T) {
+	for _, tc := range providerCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := tc.new(t)
+			rt := newTestRuntime(t, provider, testDefinition{}, WithRetryPolicy(RetryPolicy{}))
+			createMachine(t, ctx, rt, "m1", 28, stateDone)
+
+			if err := rt.Signal(ctx, NewSignal("s1", "m1", triggerStart)); err != nil {
+				t.Fatalf("signal terminal machine: %v", err)
+			}
+			processed, err := rt.Worker(WorkerConfig{ID: "worker", Shards: []ShardID{28}}).Work(ctx, 1)
+			if err != nil {
+				t.Fatalf("process terminal signal: %v", err)
+			}
+			if processed != 1 {
+				t.Fatalf("expected terminal signal to be completed, got %d", processed)
+			}
+
+			snap := readMachine(t, ctx, provider, "m1")
+			if snap.State != stateDone || snap.Version != 0 || !snap.Terminal() {
+				t.Fatalf("terminal signal should not mutate machine: %+v", snap)
+			}
+			signals := claimSignals(t, ctx, provider, "worker", 28, 1, time.Second)
+			if len(signals) != 0 {
+				t.Fatalf("completed terminal signal should not be claimable, got %+v", signals)
 			}
 		})
 	}
@@ -752,7 +909,11 @@ func TestClaimEntriesHonorsLimitAndShardLease(t *testing.T) {
 				processSignal(t, ctx, rt, provider, "signal-worker", 9, NewSignal("s-"+id, id, triggerStart))
 			}
 
-			first := claimEntries(t, ctx, provider, "worker-a", 9, 2, time.Minute)
+			leases := acquireShardLeases(t, ctx, provider, "worker-a", 9, time.Minute)
+			first, err := provider.ClaimEntries(ctx, leases, 2)
+			if err != nil {
+				t.Fatalf("first claim: %v", err)
+			}
 			if len(first) != 2 {
 				t.Fatalf("expected first claim limit of 2, got %d", len(first))
 			}
@@ -762,7 +923,10 @@ func TestClaimEntriesHonorsLimitAndShardLease(t *testing.T) {
 				t.Fatalf("different owner should not claim while shard lease is held, got %d", len(otherOwner))
 			}
 
-			second := claimEntries(t, ctx, provider, "worker-a", 9, 10, time.Minute)
+			second, err := provider.ClaimEntries(ctx, leases, 10)
+			if err != nil {
+				t.Fatalf("second claim: %v", err)
+			}
 			if len(second) != 1 {
 				t.Fatalf("same shard owner should claim remaining pending entry, got %d", len(second))
 			}

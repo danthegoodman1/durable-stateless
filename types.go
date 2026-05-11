@@ -19,6 +19,7 @@ var (
 	ErrEntryNotFound     = errors.New("durablestateless: entry not found")
 	ErrEntryNotOwned     = errors.New("durablestateless: entry is not processing for owner")
 	ErrEntryInProgress   = errors.New("durablestateless: current entry is not complete")
+	ErrInvalidLease      = errors.New("durablestateless: invalid lease duration")
 	ErrInvalidShard      = errors.New("durablestateless: invalid shard configuration")
 	ErrInvalidTransition = errors.New("durablestateless: invalid transition record")
 	ErrNilEntryHandler   = errors.New("durablestateless: entry handler is nil")
@@ -260,7 +261,8 @@ type Provider interface {
 	ReadMachine(ctx context.Context, id string) (*Snapshot, error)
 	// EnqueueSignal durably inserts a signal, deduplicated by signal ID.
 	EnqueueSignal(ctx context.Context, signal SignalRecord) error
-	// AcquireShardLeases acquires or renews ownership of the requested shards.
+	// AcquireShardLeases acquires ownership of the requested shards. Reacquiring
+	// a shard for the same owner should advance the epoch to fence older claims.
 	AcquireShardLeases(ctx context.Context, owner string, shards []ShardID, lease time.Duration) ([]ShardLease, error)
 	// RenewShardLeases extends the current shard ownership tokens. If any token
 	// is stale or expired, providers should return ErrShardLeaseLost.
