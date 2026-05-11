@@ -221,4 +221,3 @@ This is still a PoC.
 - shard ownership is enforced by recovery claims, not by `Fire`
 - cross-shard messaging should be modeled as a durable signal/outbox layer
   above this package
-# durable-stateless

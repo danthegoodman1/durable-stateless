@@ -1,0 +1,4 @@
+github.com/mattn/go-sqlite3 v1.14.44 h1:3VSe+xafpbzsLbdr2AWlAZk9yRHiBhTBakioXaCKTF8=
+github.com/mattn/go-sqlite3 v1.14.44/go.mod h1:pjEuOr8IwzLJP2MfGeTb0A35jauH+C2kbHKBr7yXKVQ=
+github.com/qmuntal/stateless v1.8.0 h1:9+Eg/7bWLKxUxs/vysNYAelFAh85kTyueC3ee6v8im8=
+github.com/qmuntal/stateless v1.8.0/go.mod h1:KWa8KVzIBD/ZS0EdzL5oU79sGq7fKwH9WEFijTC5AWw=
